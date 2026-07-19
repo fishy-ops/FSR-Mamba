@@ -1,0 +1,22 @@
+# Upstream FSR source — re-clone rather than vendor it:
+#   git clone --branch v1.1.4 \
+#     https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git fsr-upstream
+fsr-upstream/
+
+# Virtualenvs are platform-specific. The Mac wheel is CPU-only and useless on a
+# CUDA box; rebuild from pytorch.org for the target machine.
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated artifacts — all reproducible from the scripts
+prototype/out/
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db
