@@ -23,6 +23,7 @@ failure the whole project is meant to avoid.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import time
 
 import torch
@@ -222,6 +223,10 @@ def main() -> None:
     print(f"learned        PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
 
     if args.save:
+        # Create the directory here rather than requiring the caller to. This
+        # runs after training, so a missing directory would otherwise throw away
+        # the entire run's weights at the last line.
+        pathlib.Path(args.save).parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), args.save)
         print(f"saved {args.save}")
 

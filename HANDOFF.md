@@ -93,10 +93,21 @@ comparison fair — FSR's heuristic lies inside the model's hypothesis space.
 
 ## Open items, in priority order
 
-1. **Port the lock pass** (`ffx_fsr3upscaler_lock.h`). The current baseline omits
-   it, plus luma instability and the reactive masks, so it is **weaker than real
-   FSR 3.1.4**. The +1.4 dB win overstates until this is fixed. Highest-value
-   correctness work, and it is unblocked.
+1. ~~**Port the lock pass**~~ — **done** (2026-07-18, Windows session).
+   Correction to this item as originally written: there is no
+   `ffx_fsr3upscaler_lock.h` at tag v1.1.4. That was FSR 2's layout
+   (`fsr2/ffx_fsr2_lock.h`). In FSR 3.1.4 the detector is
+   `ComputeThinFeatureConfidence` at `prepare_reactivity.h:116`, dispatched from
+   `prepare_reactivity.h:278`, and the lifetime logic is `UpdateLockStatus` at
+   `accumulate.h:72` (which the baseline already had).
+   Ported into `baseline.py` behind `FSRAccumulator(enable_locks=)`. On held-out
+   synthetic scenes it is worth **+0.15 dB / +0.002 SSIM**, temporal instability
+   unchanged, with new locks firing on **0.19%** of output pixels per frame and
+   **2.81%** holding a lock. That effect is small *because the synthetic scenes
+   are nearly free of thin features* — the same homogeneity that defeats routing
+   (see below). Expect it to matter considerably more on engine capture.
+   Luma instability and the reactive masks are still unported, so the baseline
+   remains weaker than real FSR 3.1.4 and the win over it still overstates.
 2. **Engine capture.** Now needed for the *headline* claim, not just robustness:
    routing showed no benefit and the synthetic testbed was diagnosed as too
    homogeneous to test it (every scene from one 4-layer template). Capture from

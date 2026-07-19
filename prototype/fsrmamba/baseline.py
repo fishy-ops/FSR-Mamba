@@ -35,16 +35,20 @@ Simplified, and these matter:
     from a depth test, accumulation from a frame counter, and reactive /
     shading-change are stubbed to zero. On synthetic scenes with no transparency
     and no shading that is nearly right; on engine data it would not be.
-  * **The lock mechanism** is approximated. Real FSR detects thin features in a
-    separate pass (ffx_fsr3upscaler_lock.h) using a luma-neighbourhood test.
-    Here `UpdateLockStatus`'s decay logic is ported but new locks are never
-    created, so thin-feature protection is weaker than the real thing.
   * **Luma instability** (ffx_fsr3upscaler_luma_instability.h) is not ported;
     the factor is held at zero.
 
-Net effect: this baseline is somewhat *worse* than real FSR 3.1.4, mostly on
-thin features. Treat its numbers as a floor, not as "FSR's score" -- and do not
-publish a comparison against it as though it were AMD's shipping quality.
+The lock mechanism *is* now ported, including new-lock creation -- see
+`_thin_feature_confidence`. Note for anyone following older notes: there is no
+`ffx_fsr3upscaler_lock.h` at tag v1.1.4. FSR 2 had a standalone lock pass
+(`fsr2/ffx_fsr2_lock.h`, still present in the SDK); by FSR 3.1.4 the detector
+had moved into `ffx_fsr3upscaler_prepare_reactivity.h:278` and the lifetime
+logic into `ffx_fsr3upscaler_accumulate.h:72`.
+
+Net effect: this baseline is still somewhat *worse* than real FSR 3.1.4, now
+mainly through the stubbed masks and missing luma instability. Treat its numbers
+as a floor, not as "FSR's score" -- and do not publish a comparison against it
+as though it were AMD's shipping quality.
 """
 
 from __future__ import annotations
@@ -74,6 +78,23 @@ _AVERAGE_LANCZOS_WEIGHT_PER_FRAME = 0.74 * _UPSAMPLE_LANCZOS_WEIGHT_SCALE
 # common.h:55-56
 _LOCK_THRESHOLD = 1.0
 _LOCK_MAX = 2.0
+
+# prepare_reactivity.h:152 -- neighbours closer than this fraction of the local
+# luma range count as "similar" and set their pattern bit.
+_LOCK_SIMILARITY_THRESHOLD = 0.9
+
+# prepare_reactivity.h:279
+_NEW_LOCK_MIN_STRENGTH = 1.0 / 100.0
+
+# prepare_reactivity.h:161-166. Each mask is a complete 2x2 quadrant plus the
+# nucleus; a pixel matching any of them is a surface, not a thin feature.
+#   bit 0 = nucleus, bits 1-8 = neighbours in the order given in the diagram.
+_LOCK_REJECTION_MASKS = (
+    (1 << 1) | (1 << 2) | (1 << 4) | 1,  # upper left
+    (1 << 2) | (1 << 3) | (1 << 5) | 1,  # upper right
+    (1 << 4) | (1 << 6) | (1 << 7) | 1,  # lower left
+    (1 << 5) | (1 << 7) | (1 << 8) | 1,  # lower right
+)
 
 # upsample.h:609. The rectification box uses a Gaussian-ish falloff, NOT the
 # Lanczos kernel used for the resolve. They are different filters for different
@@ -154,18 +175,126 @@ class FSRAccumulator:
         device: torch.device | str = "cpu",
         lock_max: float = _LOCK_MAX,
         lock_threshold: float = _LOCK_THRESHOLD,
+        enable_locks: bool = True,
     ) -> None:
         self.render_size = render_size
         self.output_size = output_size
         self.device = torch.device(device)
         self.lock_max = lock_max
         self.lock_threshold = lock_threshold
+        # Kept switchable so the lock pass can be ablated against the earlier
+        # lock-free baseline rather than only compared from memory.
+        self.enable_locks = enable_locks
 
         h, w = output_size
         ys = torch.arange(h, device=device, dtype=torch.float32) + 0.5
         xs = torch.arange(w, device=device, dtype=torch.float32) + 0.5
         self._hr_x, self._hr_y = torch.meshgrid(xs, ys, indexing="xy")
         self._hr_uv = torch.stack((self._hr_x / w, self._hr_y / h), dim=-1)
+
+    # -- thin-feature locks -------------------------------------------------
+
+    def _thin_feature_confidence(self, lr_rgb: torch.Tensor) -> torch.Tensor:
+        """Ports ComputeThinFeatureConfidence (prepare_reactivity.h:116).
+
+        A ridge test on a 3x3 luma neighbourhood, at *render* resolution. The
+        pixel scores if it is a local luma extremum relative to its dissimilar
+        neighbours -- i.e. a thin bright or dark feature that temporal
+        accumulation would otherwise dissolve.
+
+        The bitmask step (prepare_reactivity.h:158-199) is the part worth
+        reading twice: a pixel whose similar neighbours fill any complete 2x2
+        quadrant is rejected, because that means it belongs to a *surface*
+        rather than a thin feature. Four quadrant masks, all including the
+        nucleus bit.
+
+        Returns lock strength in [0, 1] at render resolution.
+        """
+        lr_h, lr_w = self.render_size
+
+        # LoadCurrentLuma * Exposure (prepare_reactivity.h:146). Exposure is 1
+        # here -- this port has no exposure pass.
+        luma = rgb_to_ycocg(lr_rgb)[..., 0]
+
+        # ClampLoad (prepare_reactivity.h:145) clamps to the edge, so replicate.
+        padded = F.pad(luma[None, None], (1, 1, 1, 1), mode="replicate")[0, 0]
+
+        # Sample order matters -- the bit indices below depend on it:
+        #   1 2 3
+        #   4 0 5
+        #   6 7 8
+        offsets = [
+            (0, 0), (-1, -1), (0, -1), (1, -1), (-1, 0),
+            (1, 0), (-1, 1), (0, 1), (1, 1),
+        ]
+        samples = torch.stack(
+            [padded[1 + dy : 1 + dy + lr_h, 1 + dx : 1 + dx + lr_w] for dx, dy in offsets]
+        )
+
+        nucleus = samples[0]
+        neighbours = samples[1:]
+        luma_min = samples.min(dim=0).values
+        luma_max = samples.max(dim=0).values
+        spread = luma_max - luma_min
+
+        difference = (neighbours - nucleus).abs() / spread.clamp(min=_EPSILON)
+        similar = difference < _LOCK_SIMILARITY_THRESHOLD
+
+        # The HLSL's asymmetric initialisers (max=0, min=FP32_MAX) are load
+        # bearing: when every neighbour is similar they survive untouched, which
+        # makes the ridge test pass -- and then the quadrant masks reject the
+        # pixel anyway. Reproducing them keeps that path identical.
+        neg_inf = torch.full_like(nucleus, float("-inf"))
+        pos_inf = torch.full_like(nucleus, float("inf"))
+        dissimilar = ~similar
+        dis_max = torch.where(dissimilar, neighbours, neg_inf).max(dim=0).values.clamp(min=0.0)
+        dis_min = torch.where(dissimilar, neighbours, pos_inf).min(dim=0).values
+
+        is_ridge = (nucleus > dis_max) | (nucleus < dis_min)
+
+        pattern = torch.ones_like(nucleus, dtype=torch.int32)  # nucleus bit
+        for i in range(8):
+            pattern = pattern | (similar[i].to(torch.int32) << (i + 1))
+
+        rejected = torch.zeros_like(nucleus, dtype=torch.bool)
+        for mask in _LOCK_REJECTION_MASKS:
+            rejected = rejected | ((pattern & mask) == mask)
+
+        confidence = 1.0 - luma_min / luma_max.clamp(min=_EPSILON)
+        keep = is_ridge & ~rejected & (spread > 0.0) & (luma_max > 0.0)
+        return torch.where(keep, confidence, torch.zeros_like(confidence)).clamp(0, 1)
+
+    def _compute_new_locks(
+        self, lr_rgb: torch.Tensor, jitter: tuple[float, float]
+    ) -> torch.Tensor:
+        """StoreNewLocks (prepare_reactivity.h:278-282) at output resolution.
+
+        Locks are *sparse* in the output image: each render-res pixel writes to
+        exactly one output pixel via ComputeHrPosFromLrPos (common.h:296), so at
+        2x upscale at most one output pixel in four can be newly locked. Blurring
+        the strength across the footprint instead would protect far more area
+        than FSR does, which is why this scatters rather than interpolates.
+        """
+        strength = self._thin_feature_confidence(lr_rgb)
+
+        lr_h, lr_w = self.render_size
+        out_h, out_w = self.output_size
+        dev = self.device
+
+        ys = torch.arange(lr_h, device=dev, dtype=torch.float32)
+        xs = torch.arange(lr_w, device=dev, dtype=torch.float32)
+        gx, gy = torch.meshgrid(xs, ys, indexing="xy")
+
+        # common.h:296-302, same jitter convention as the resolve above.
+        hx = torch.floor((gx + 0.5 - jitter[0]) / lr_w * out_w).long().clamp(0, out_w - 1)
+        hy = torch.floor((gy + 0.5 - jitter[1]) / lr_h * out_h).long().clamp(0, out_h - 1)
+
+        new_locks = torch.zeros((out_h, out_w), device=dev)
+        keep = strength > _NEW_LOCK_MIN_STRENGTH
+        if keep.any():
+            flat_idx = (hy * out_w + hx)[keep]
+            new_locks.view(-1).scatter_(0, flat_idx, strength[keep])
+        return new_locks
 
     # -- resolve -----------------------------------------------------------
 
@@ -378,11 +507,23 @@ class FSRAccumulator:
             shading_change.clamp(0, 1), torch.maximum(reactive, disocclusion)
         )
         lock = (lock - lifetime_decrease_factor * self.lock_max).clamp(min=0.0)
+        # accumulate.h:80. Computed from the *decayed* lock, before this frame's
+        # new locks land -- a lock has to survive a frame before it protects
+        # anything. Reordering these two blocks would let brand-new locks
+        # suppress rectification immediately, which is a ghosting bug.
         lock_contribution = (
             ((lock - self.lock_threshold).clamp(0, 1) * (self.lock_max - self.lock_threshold))
             .clamp(0, 1)
         )
-        # NOTE: new locks are never added -- the detection pass is not ported.
+
+        # accumulate.h:82-83. `fShadingChange * 0` in the HLSL really is the
+        # shading-change term multiplied out, leaving only the reactive mask --
+        # it reads like a bug but it is upstream's, and this port keeps it.
+        if self.enable_locks:
+            new_locks = self._compute_new_locks(lr_rgb, jitter)
+            new_lock_intensity = new_locks * (1.0 - reactive.clamp(0, 1))
+            lock = (lock + new_lock_intensity).clamp(0.0, self.lock_max)
+
         lifetime_decrease = (0.1 / 16.0) * (1.0 - lifetime_decrease_factor)
         lock = (lock - lifetime_decrease).clamp(min=0.0)
 
