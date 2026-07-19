@@ -34,8 +34,13 @@ from fsrmamba.metrics import psnr, ssim, temporal_instability
 from fsrmamba.synth import halton_jitter, random_scene
 
 
-def render_sequence(scene, n_frames, render_size, out_size, gt_ss):
-    """Pre-render one sequence into a list of per-frame dicts."""
+def render_sequence(scene, n_frames, render_size, out_size, gt_ss, device="cpu"):
+    """Pre-render one sequence into a list of per-frame dicts.
+
+    Scenes render on CPU (they are numpy/torch analytic maths, not GPU work), so
+    the frames are moved to `device` once here rather than per training step --
+    the whole point of pre-rendering is that this cost is paid once.
+    """
     frames = []
     for i in range(n_frames):
         j = halton_jitter(i)
@@ -44,11 +49,11 @@ def render_sequence(scene, n_frames, render_size, out_size, gt_ss):
         gt = scene.render(i, out_size, jitter=(0.0, 0.0), supersample=gt_ss)
         frames.append(
             {
-                "lr": lr.color,
-                "mv": aux.mv,
-                "depth": aux.depth,
-                "gt": gt.color,
-                "jitter": j,
+                "lr": lr.color.to(device),
+                "mv": aux.mv.to(device),
+                "depth": aux.depth.to(device),
+                "gt": gt.color.to(device),
+                "jitter": j,  # a plain tuple of floats, not a tensor
             }
         )
     return frames
@@ -70,13 +75,13 @@ def warp_prev(img, mv):
     )[0].permute(1, 2, 0)
 
 
-def evaluate(model, frames, out_size, state_channels):
+def evaluate(model, frames, out_size, state_channels, device="cpu"):
     """Run a model over a sequence and return (psnr, ssim, temporal instability)."""
     is_learned = isinstance(model, MambaAccumulator)
     state = (
-        MambaState.zeros(out_size, state_channels)
+        MambaState.zeros(out_size, state_channels, device=device)
         if is_learned
-        else FSRState.zeros(out_size)
+        else FSRState.zeros(out_size, device=device)
     )
     prev_out, prev_depth = None, None
     tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
@@ -130,18 +135,18 @@ def main() -> None:
     t0 = time.time()
     train_seqs = [
         render_sequence(random_scene(s, out_size), args.seq_len, render_size, out_size,
-                        args.gt_supersample)
+                        args.gt_supersample, device=dev)
         for s in train_seeds
     ]
     val_seqs = [
         render_sequence(random_scene(s, out_size), args.seq_len, render_size, out_size,
-                        args.gt_supersample)
+                        args.gt_supersample, device=dev)
         for s in val_seeds
     ]
     print(f"  done in {time.time()-t0:.1f}s")
 
     def eval_all(model):
-        rs = [evaluate(model, s, out_size, args.state_channels) for s in val_seqs]
+        rs = [evaluate(model, s, out_size, args.state_channels, device=dev) for s in val_seqs]
         return tuple(sum(v) / len(rs) for v in zip(*rs))
 
     # --- baseline reference ---
