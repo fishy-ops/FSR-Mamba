@@ -1,8 +1,44 @@
+diff --git a/framework/cauldron/framework/src/core/components/cameracomponent.cpp b/framework/cauldron/framework/src/core/components/cameracomponent.cpp
+index 6c554ab..4d21e3a 100644
+--- a/framework/cauldron/framework/src/core/components/cameracomponent.cpp
++++ b/framework/cauldron/framework/src/core/components/cameracomponent.cpp
+@@ -30,6 +30,7 @@
+ #include "misc/math.h"
+ 
+ #include<algorithm>
++#include <cstdlib>   // FSR-Mamba: getenv/atof for the capture auto-orbit
+ 
+ namespace cauldron
+ {
+@@ -291,7 +292,22 @@ namespace cauldron
+                     m_Pitch += inputState.GetMouseAxisDelta(Mouse_YAxis) / 100.f;
+                     hasRotation = true;
+                 }
+-                
++
++                // FSR-Mamba: programmatic arc-ball orbit for unattended capture --
++                // implements the "Support camera animations" TODO above. Env var
++                // FSRMAMBA_CAMERA_ORBIT gives yaw radians/frame (e.g. 0.005). This
++                // gives the whole frame consistent motion vectors without a human
++                // flying the camera, so capture can run across every scene.
++                static const float s_autoOrbit = []() {
++                    const char* s = std::getenv("FSRMAMBA_CAMERA_ORBIT");
++                    return s ? static_cast<float>(std::atof(s)) : 0.f;
++                }();
++                if (s_autoOrbit != 0.f)
++                {
++                    m_Yaw += s_autoOrbit;
++                    hasRotation = true;
++                }
++
+                 // If hitting the 'r' key or back button on game pad, reset camera to original transform
+                 if (inputState.GetKeyState(Key_R) || inputState.GetGamePadButtonState(Pad_Back))
+                 {
 diff --git a/samples/fsrapi/fsrapirendermodule.cpp b/samples/fsrapi/fsrapirendermodule.cpp
-index 36649fe..4e1c31a 100644
+index 36649fe..5baae12 100644
 --- a/samples/fsrapi/fsrapirendermodule.cpp
 +++ b/samples/fsrapi/fsrapirendermodule.cpp
-@@ -22,6 +22,11 @@
+@@ -22,6 +22,12 @@
  
  #include "fsrapirendermodule.h"
  #include "render/rendermodules/ui/uirendermodule.h"
@@ -10,11 +46,12 @@ index 36649fe..4e1c31a 100644
 +// FSR-Mamba capture
 +#include <fstream>
 +#include <cstdlib>
++#include <chrono>
 +#include "render/gpuresource.h"
  #include "render/rasterview.h"
  #include "render/dynamicresourcepool.h"
  #include "render/parameterset.h"
-@@ -74,6 +79,9 @@ void FSRRenderModule::Init(const json& initData)
+@@ -74,6 +80,9 @@ void FSRRenderModule::Init(const json& initData)
      m_pCompositionMask       = GetFramework()->GetRenderTexture(L"TransCompMask");
      CauldronAssert(ASSERT_CRITICAL, m_pMotionVectors && m_pDistortionField[0] && m_pDistortionField[1] && m_pReactiveMask && m_pCompositionMask, L"Could not get one of the needed resources for FSR Rendermodule.");
  
@@ -24,7 +61,7 @@ index 36649fe..4e1c31a 100644
      // Get a CPU resource view that we'll use to map the render target to
      GetResourceViewAllocator()->AllocateCPURenderViews(&m_pRTResourceView);
  
-@@ -1153,6 +1161,13 @@ ResolutionInfo FSRRenderModule::UpdateResolution(uint32_t displayWidth, uint32_t
+@@ -1153,6 +1162,13 @@ ResolutionInfo FSRRenderModule::UpdateResolution(uint32_t displayWidth, uint32_t
  
  void FSRRenderModule::OnPreFrame()
  {
@@ -38,7 +75,7 @@ index 36649fe..4e1c31a 100644
      if (NeedsReInit())
      {
          GetDevice()->FlushAllCommandQueues();
-@@ -1176,6 +1191,280 @@ void FSRRenderModule::OnPreFrame()
+@@ -1176,6 +1192,297 @@ void FSRRenderModule::OnPreFrame()
      }
  }
  
@@ -90,6 +127,11 @@ index 36649fe..4e1c31a 100644
 +    m_CaptureDir = dir;
 +    if (const char* s = std::getenv("FSRMAMBA_CAPTURE_START")) m_CaptureStart = (uint32_t)std::atoi(s);
 +    if (const char* c = std::getenv("FSRMAMBA_CAPTURE_COUNT")) m_CaptureCount = (uint32_t)std::atoi(c);
++    // Wall-clock warmup: wait this many real seconds before the first capture.
++    // More reliable than a frame count when the disk is the bottleneck -- the app
++    // renders empty frames quickly while assets are still streaming in, so a frame
++    // count elapses long before the scene is actually drawn.
++    if (const char* w = std::getenv("FSRMAMBA_CAPTURE_WARMUP_SEC")) m_WarmupSec = std::atof(w);
 +
 +    // The output directory is created by the launch script before the app
 +    // starts (see run_capture in the harness), so no filesystem calls here --
@@ -117,8 +159,8 @@ index 36649fe..4e1c31a 100644
 +    m_pCaptureMotion = makeCapTex(cauldron::ResourceFormat::RG16_FLOAT, L"FSRMamba_CaptureMotion");
 +
 +    std::wstring wdir(m_CaptureDir.begin(), m_CaptureDir.end());
-+    cauldron::Log::Write(LOGLEVEL_INFO, L"[FSR-Mamba] capture -> %ls (skip=%u count=%u)",
-+                         wdir.c_str(), m_CaptureStart, m_CaptureCount);
++    cauldron::Log::Write(LOGLEVEL_INFO, L"[FSR-Mamba] capture -> %ls (warmup=%.1fs skip=%u count=%u)",
++                         wdir.c_str(), m_WarmupSec, m_CaptureStart, m_CaptureCount);
 +}
 +
 +// Copy the live depth & motion targets into persistent capture textures, on the
@@ -168,6 +210,18 @@ index 36649fe..4e1c31a 100644
 +
 +void FSRRenderModule::CaptureFrame()
 +{
++    // Wall-clock warmup gate. The timer starts on the first call (≈ app start);
++    // until it elapses we return without counting frames, so the scene has real
++    // time to finish streaming regardless of frame rate.
++    if (m_WarmupSec > 0.0)
++    {
++        static const auto s_t0 = std::chrono::steady_clock::now();
++        const double elapsed = std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - s_t0).count();
++        if (elapsed < m_WarmupSec)
++            return;
++    }
++
 +    const uint64_t seen = m_CaptureFrameSeen++;
 +    if (seen < m_CaptureStart)
 +        return;
@@ -319,7 +373,7 @@ index 36649fe..4e1c31a 100644
  void FSRRenderModule::OnResize(const ResolutionInfo& resInfo)
  {
      if (!ModuleEnabled())
-@@ -1240,6 +1529,10 @@ void FSRRenderModule::Execute(double deltaTime, CommandList* pCmdList)
+@@ -1240,6 +1547,10 @@ void FSRRenderModule::Execute(double deltaTime, CommandList* pCmdList)
          ResourceBarrier(pCmdList, static_cast<uint32_t>(barriers.size()), barriers.data());
      }
  
@@ -331,7 +385,7 @@ index 36649fe..4e1c31a 100644
      // If they become changeable at runtime, we'll need to modify how this information is queried
      static bool s_InvertedDepth = GetConfig()->InvertedDepth;
 diff --git a/samples/fsrapi/fsrapirendermodule.h b/samples/fsrapi/fsrapirendermodule.h
-index 048fb67..a77d675 100644
+index 048fb67..2a3bf5b 100644
 --- a/samples/fsrapi/fsrapirendermodule.h
 +++ b/samples/fsrapi/fsrapirendermodule.h
 @@ -98,6 +98,22 @@ public:
@@ -357,7 +411,7 @@ index 048fb67..a77d675 100644
      void SetFilter(int32_t method)
      {
          m_UpscaleMethod = method;
-@@ -268,6 +284,22 @@ private:
+@@ -268,6 +284,23 @@ private:
      uint32_t m_HybridSpinTime;
      bool m_AllowWaitForSingleObjectOnFence;
      FfxApiSwapchainFramePacingTuning framePacingTuning;
@@ -366,6 +420,7 @@ index 048fb67..a77d675 100644
 +    bool        m_CaptureEnabled     = false;
 +    uint32_t    m_CaptureStart       = 8;
 +    uint32_t    m_CaptureCount       = 32;
++    double      m_WarmupSec          = 0.0;  // wall-clock seconds to wait before capturing
 +    uint64_t    m_CaptureFrameSeen   = 0;   // OnPreFrame calls seen while enabled
 +    uint32_t    m_CaptureWritten     = 0;   // frames actually dumped
 +    std::string m_CaptureDir;
