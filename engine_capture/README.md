@@ -36,27 +36,53 @@ git apply ../engine_capture/fsrapi_capture.patch
 Driven entirely by environment variables — no config-file edits:
 
 ```
-FSRMAMBA_CAPTURE_DIR    output directory (also enables capture when set)
-FSRMAMBA_CAPTURE_START  frames to skip before capturing (default 8)
-FSRMAMBA_CAPTURE_COUNT  frames to capture (default 32)
+FSRMAMBA_CAPTURE_DIR         output directory (also enables capture when set)
+FSRMAMBA_CAPTURE_WARMUP_SEC  wall-clock seconds to wait before capturing (default 0)
+FSRMAMBA_CAPTURE_START       frames to skip before capturing (default 8)
+FSRMAMBA_CAPTURE_COUNT       frames to capture (default 32)
+FSRMAMBA_CAMERA_ORBIT        yaw radians/frame for the auto-orbit (default 0 = off)
 ```
 
-Create the output dir first (the app does not), then launch the built exe with
-those vars set. On this machine the exe must be launched via a shell that
-resolves the current directory (Git Bash `./FFX_API_FSR_DX12.exe`), not a bare
-name under `cmd` — `cmd` here does not search the working directory for exes.
+Fully unattended capture — no human at the keyboard — looks like:
 
-## Two things learned the hard way
+```bash
+mkdir -p /d/FSR-Mamba/captures/sponza
+cd fsr-upstream/bin
+FSRMAMBA_CAPTURE_DIR=D:/FSR-Mamba/captures/sponza \
+FSRMAMBA_CAPTURE_WARMUP_SEC=60 \
+FSRMAMBA_CAPTURE_COUNT=24 \
+FSRMAMBA_CAMERA_ORBIT=0.006 \
+  ./FFX_API_FSR_DX12.exe
+```
 
-1. **Wait for the scene to load.** `FSRMAMBA_CAPTURE_START` must be large enough
-   (a few hundred frames) that the scene has finished streaming in. Capturing
-   too early gives a nearly-empty room: valid color but near-empty depth and
-   motion. This is not a bug in the capture — the scene genuinely was not drawn
-   yet.
+Create the output dir first (the app does not). On this machine the exe must be
+launched via a shell that resolves the current directory (Git Bash
+`./FFX_API_FSR_DX12.exe`), not a bare name under `cmd` — `cmd` here does not
+search the working directory for exes.
+
+`FSRMAMBA_CAMERA_ORBIT` implements the framework's own commented-out
+"Support camera animations" TODO in `CameraComponent::Update()`: it adds a small
+yaw increment to the arc-ball camera every frame, giving the whole frame
+consistent motion vectors without anyone flying the camera. `0.006` rad/frame is
+a gentle, realistic pan; larger values move faster (keep it small enough that
+FSR's history reprojection stays valid). This is why the patch also touches
+`framework/.../cameracomponent.cpp`.
+
+## Two things learned the hard way (both now have built-in fixes)
+
+1. **Wait for the scene to load — in wall-clock time, not frames.** Capturing
+   early gives a nearly-empty room: valid color but empty depth and motion. This
+   is not a capture bug; the scene genuinely was not drawn yet. A *frame count*
+   (`FSRMAMBA_CAPTURE_START`) is an unreliable proxy because when the disk is the
+   bottleneck the app renders empty frames quickly while assets stream slowly —
+   hundreds of frames elapse before the scene appears. Use
+   `FSRMAMBA_CAPTURE_WARMUP_SEC` instead (≈60s on a spinning disk here). It times
+   from app start and does not begin capturing until that many real seconds pass.
 
 2. **Motion vectors need camera movement.** With a static camera they are
-   legitimately zero. Fly the camera during the capture window, or add a
-   programmatic camera path for reproducible unattended capture.
+   legitimately zero. `FSRMAMBA_CAMERA_ORBIT` drives an automatic orbit so every
+   captured frame has motion, unattended. (Flying the camera manually during the
+   capture window also works, but is not reproducible.)
 
 ## How it works (for the next person editing it)
 
