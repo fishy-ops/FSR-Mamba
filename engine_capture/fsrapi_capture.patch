@@ -1,0 +1,382 @@
+diff --git a/samples/fsrapi/fsrapirendermodule.cpp b/samples/fsrapi/fsrapirendermodule.cpp
+index 36649fe..4e1c31a 100644
+--- a/samples/fsrapi/fsrapirendermodule.cpp
++++ b/samples/fsrapi/fsrapirendermodule.cpp
+@@ -22,6 +22,11 @@
+ 
+ #include "fsrapirendermodule.h"
+ #include "render/rendermodules/ui/uirendermodule.h"
++
++// FSR-Mamba capture
++#include <fstream>
++#include <cstdlib>
++#include "render/gpuresource.h"
+ #include "render/rasterview.h"
+ #include "render/dynamicresourcepool.h"
+ #include "render/parameterset.h"
+@@ -74,6 +79,9 @@ void FSRRenderModule::Init(const json& initData)
+     m_pCompositionMask       = GetFramework()->GetRenderTexture(L"TransCompMask");
+     CauldronAssert(ASSERT_CRITICAL, m_pMotionVectors && m_pDistortionField[0] && m_pDistortionField[1] && m_pReactiveMask && m_pCompositionMask, L"Could not get one of the needed resources for FSR Rendermodule.");
+ 
++    // FSR-Mamba: read capture config from environment (no config-file edits).
++    CaptureInit();
++
+     // Get a CPU resource view that we'll use to map the render target to
+     GetResourceViewAllocator()->AllocateCPURenderViews(&m_pRTResourceView);
+ 
+@@ -1153,6 +1161,13 @@ ResolutionInfo FSRRenderModule::UpdateResolution(uint32_t displayWidth, uint32_t
+ 
+ void FSRRenderModule::OnPreFrame()
+ {
++    // FSR-Mamba: capture the just-completed frame. OnPreFrame runs before
++    // BeginFrame (framework.cpp MainLoop), so the four FSR resources still hold
++    // the previous frame's coherent inputs+output and no frame command list is
++    // pending -- a synchronous readback here is race-free.
++    if (m_CaptureEnabled)
++        CaptureFrame();
++
+     if (NeedsReInit())
+     {
+         GetDevice()->FlushAllCommandQueues();
+@@ -1176,6 +1191,280 @@ void FSRRenderModule::OnPreFrame()
+     }
+ }
+ 
++// ============================ FSR-Mamba capture ============================
++
++#if defined(FFX_API_DX12)
++namespace
++{
++    // Describe a DXGI format for the PyTorch loader as (channels, numpy dtype).
++    // Keyed on DXGI_FORMAT rather than Cauldron's ResourceFormat because the
++    // depth target's format is not in Cauldron's GetResourceFormatStride table
++    // (that omission is what aborted the first capture). GetCopyableFootprints
++    // supplies the actual byte layout, so this only needs to name the dtype.
++    void DescribeDxgiFormat(DXGI_FORMAT fmt, int& channels, std::string& dtype)
++    {
++        switch (fmt)
++        {
++        case DXGI_FORMAT_R8_UNORM:            channels = 1; dtype = "uint8";   break;
++        case DXGI_FORMAT_R8G8_UNORM:          channels = 2; dtype = "uint8";   break;
++        case DXGI_FORMAT_R8G8B8A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        case DXGI_FORMAT_B8G8R8A8_UNORM:      channels = 4; dtype = "uint8";   break;
++        case DXGI_FORMAT_R16_FLOAT:           channels = 1; dtype = "float16"; break;
++        case DXGI_FORMAT_R16G16_FLOAT:        channels = 2; dtype = "float16"; break;
++        case DXGI_FORMAT_R16G16B16A16_FLOAT:  channels = 4; dtype = "float16"; break;
++        case DXGI_FORMAT_R16G16B16A16_UNORM:  channels = 4; dtype = "uint16";  break;
++        case DXGI_FORMAT_R16_UNORM:           channels = 1; dtype = "uint16";  break;
++        case DXGI_FORMAT_R32_TYPELESS:
++        case DXGI_FORMAT_D32_FLOAT:
++        case DXGI_FORMAT_R32_FLOAT:           channels = 1; dtype = "float32"; break;
++        case DXGI_FORMAT_R32G32_FLOAT:        channels = 2; dtype = "float32"; break;
++        case DXGI_FORMAT_R32G32B32A32_FLOAT:  channels = 4; dtype = "float32"; break;
++        case DXGI_FORMAT_R11G11B10_FLOAT:     channels = 3; dtype = "rg11b10"; break; // packed 32-bit
++        case DXGI_FORMAT_R10G10B10A2_UNORM:   channels = 4; dtype = "rgb10a2"; break; // packed 32-bit
++        default:                              channels = 0; dtype = "raw";     break;
++        }
++    }
++}
++#endif
++
++void FSRRenderModule::CaptureInit()
++{
++    const char* dir = std::getenv("FSRMAMBA_CAPTURE_DIR");
++    if (!dir || dir[0] == '\0')
++    {
++        m_CaptureEnabled = false;
++        return;
++    }
++    m_CaptureDir = dir;
++    if (const char* s = std::getenv("FSRMAMBA_CAPTURE_START")) m_CaptureStart = (uint32_t)std::atoi(s);
++    if (const char* c = std::getenv("FSRMAMBA_CAPTURE_COUNT")) m_CaptureCount = (uint32_t)std::atoi(c);
++
++    // The output directory is created by the launch script before the app
++    // starts (see run_capture in the harness), so no filesystem calls here --
++    // the framework targets the C++14/17 boundary and std::filesystem is not
++    // reliably available.
++
++    m_CaptureEnabled   = true;
++    m_CaptureFrameSeen = 0;
++    m_CaptureWritten   = 0;
++
++    // Persistent copy targets for depth & motion, display-sized like the color
++    // target. Depth is stored as R32_FLOAT (copy-compatible with the D32/R32
++    // depth source); motion as RG16_FLOAT to match GBufferMotionVectorRT.
++    auto makeCapTex = [this](cauldron::ResourceFormat fmt, const wchar_t* name) -> const cauldron::Texture* {
++        cauldron::TextureDesc d = m_pColorTarget->GetDesc();
++        d.Format = fmt;
++        d.Name   = name;
++        return GetDynamicResourcePool()->CreateRenderTexture(
++            &d, [](cauldron::TextureDesc& desc, uint32_t dw, uint32_t dh, uint32_t rw, uint32_t rh) {
++                desc.Width  = dw;
++                desc.Height = dh;
++            });
++    };
++    m_pCaptureDepth  = makeCapTex(cauldron::ResourceFormat::R32_FLOAT,  L"FSRMamba_CaptureDepth");
++    m_pCaptureMotion = makeCapTex(cauldron::ResourceFormat::RG16_FLOAT, L"FSRMamba_CaptureMotion");
++
++    std::wstring wdir(m_CaptureDir.begin(), m_CaptureDir.end());
++    cauldron::Log::Write(LOGLEVEL_INFO, L"[FSR-Mamba] capture -> %ls (skip=%u count=%u)",
++                         wdir.c_str(), m_CaptureStart, m_CaptureCount);
++}
++
++// Copy the live depth & motion targets into persistent capture textures, on the
++// frame command list, while they are still valid FSR inputs. Called from
++// Execute() right before the upscale dispatch.
++void FSRRenderModule::CaptureCopyInputs(cauldron::CommandList* pCmdList)
++{
++    using namespace cauldron;
++    if (!m_pCaptureDepth || !m_pCaptureMotion)
++        return;
++
++    struct Pair { const Texture* src; const Texture* dst; };
++    const Pair pairs[2] = {
++        { m_pDepthTarget,   m_pCaptureDepth  },
++        { m_pMotionVectors, m_pCaptureMotion },
++    };
++
++    static bool s_loggedOnce = false;
++    for (const Pair& p : pairs)
++    {
++        const ResourceState srcState = p.src->GetResource()->GetCurrentResourceState();
++        const ResourceState dstState = p.dst->GetResource()->GetCurrentResourceState();
++        if (!s_loggedOnce)
++        {
++            const TextureDesc& sd = p.src->GetDesc();
++            cauldron::Log::Write(LOGLEVEL_INFO,
++                L"[FSR-Mamba] copy src '%ls' %ux%u srcState=0x%x dstState=0x%x",
++                sd.Name.c_str(), sd.Width, sd.Height, (uint32_t)srcState, (uint32_t)dstState);
++        }
++        std::vector<Barrier> pre = {
++            Barrier::Transition(p.src->GetResource(), srcState, ResourceState::CopySource),
++            Barrier::Transition(p.dst->GetResource(), dstState, ResourceState::CopyDest),
++        };
++        ResourceBarrier(pCmdList, (uint32_t)pre.size(), pre.data());
++
++        TextureCopyDesc copyDesc(p.src->GetResource(), p.dst->GetResource());
++        CopyTextureRegion(pCmdList, &copyDesc);
++
++        std::vector<Barrier> post = {
++            Barrier::Transition(p.src->GetResource(), ResourceState::CopySource, srcState),
++            Barrier::Transition(p.dst->GetResource(), ResourceState::CopyDest, dstState),
++        };
++        ResourceBarrier(pCmdList, (uint32_t)post.size(), post.data());
++    }
++    s_loggedOnce = true;
++}
++
++void FSRRenderModule::CaptureFrame()
++{
++    const uint64_t seen = m_CaptureFrameSeen++;
++    if (seen < m_CaptureStart)
++        return;
++    if (m_CaptureWritten >= m_CaptureCount)
++    {
++        m_CaptureEnabled = false;  // done; stop the per-frame stall
++        cauldron::Log::Write(LOGLEVEL_INFO, L"[FSR-Mamba] capture complete: %u frames", m_CaptureWritten);
++        return;
++    }
++
++    const uint32_t idx = m_CaptureWritten++;
++    const cauldron::ResolutionInfo& resInfo = GetFramework()->GetResolutionInfo();
++
++    // Drain *every* queue before reading. The per-texture readback below only
++    // fences the graphics queue; with async compute enabled the depth and motion
++    // targets can still be in flight on the compute queue, which showed up as
++    // zero/partial depth+motion while the graphics-produced color was fine.
++    GetDevice()->FlushAllCommandQueues();
++
++    char base[1024];
++    snprintf(base, sizeof(base), "%s/frame_%04u", m_CaptureDir.c_str(), idx);
++    const std::string basePath = base;
++
++    std::string meta = "{\n";
++    char line[256];
++    snprintf(line, sizeof(line), "  \"frame\": %u,\n", idx); meta += line;
++    snprintf(line, sizeof(line), "  \"renderWidth\": %u,\n  \"renderHeight\": %u,\n", resInfo.RenderWidth, resInfo.RenderHeight); meta += line;
++    snprintf(line, sizeof(line), "  \"upscaleWidth\": %u,\n  \"upscaleHeight\": %u,\n", resInfo.UpscaleWidth, resInfo.UpscaleHeight); meta += line;
++    snprintf(line, sizeof(line), "  \"jitterX\": %.8f,\n  \"jitterY\": %.8f,\n", m_JitterX, m_JitterY); meta += line;
++
++    std::string fld;
++    // color_lr / color_hr come from persistent targets; depth / motion from the
++    // Execute-time snapshots (the live GBuffer targets are empty by now).
++    DumpTextureRaw(m_pTempTexture,    basePath + "_color_lr.bin", fld); meta += "  \"color_lr\": " + fld + ",\n";
++    DumpTextureRaw(m_pColorTarget,    basePath + "_color_hr.bin", fld); meta += "  \"color_hr\": " + fld + ",\n";
++    DumpTextureRaw(m_pCaptureDepth,   basePath + "_depth.bin",    fld); meta += "  \"depth\": "    + fld + ",\n";
++    DumpTextureRaw(m_pCaptureMotion,  basePath + "_motion.bin",   fld); meta += "  \"motion\": "   + fld + "\n";
++    meta += "}\n";
++
++    std::ofstream mf(basePath + ".json", std::ios::binary);
++    mf << meta;
++}
++
++void FSRRenderModule::DumpTextureRaw(const cauldron::Texture* pTex, const std::string& binPath, std::string& outMetaFields)
++{
++    outMetaFields = "null";
++    if (!pTex)
++        return;
++
++#if defined(FFX_API_DX12)
++    using namespace cauldron;
++
++    GPUResource*    pRes  = const_cast<GPUResource*>(pTex->GetResource());
++    ID3D12Resource* pSrc  = pRes->GetImpl()->DX12Resource();
++    D3D12_RESOURCE_DESC fromDesc = pRes->GetImpl()->DX12Desc();
++    ID3D12Device*   pDev  = GetDevice()->GetImpl()->DX12Device();
++
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
++    UINT   numRows        = 0;
++    UINT64 rowSizeInBytes = 0;
++    UINT64 totalBytes     = 0;
++    pDev->GetCopyableFootprints(&fromDesc, 0, 1, 0, &layout, &numRows, &rowSizeInBytes, &totalBytes);
++
++    // Readback (CPU-visible) staging buffer sized to the copyable footprint.
++    D3D12_HEAP_PROPERTIES heap = {};
++    heap.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bufDesc = {};
++    bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
++    bufDesc.Width            = totalBytes;
++    bufDesc.Height           = 1;
++    bufDesc.DepthOrArraySize = 1;
++    bufDesc.MipLevels        = 1;
++    bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
++    bufDesc.SampleDesc.Count = 1;
++    bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++
++    ID3D12Resource* pReadback = nullptr;
++    if (FAILED(pDev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufDesc,
++                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pReadback))))
++        return;
++
++    // Transition -> CopySource, copy, transition back, all on one throwaway list.
++    const ResourceState origState = pRes->GetCurrentResourceState();
++    CommandList* pCmdList = GetDevice()->CreateCommandList(L"FsrMambaCaptureCL", CommandQueue::Graphics);
++
++    Barrier toCopy = Barrier::Transition(pRes, origState, ResourceState::CopySource);
++    ResourceBarrier(pCmdList, 1, &toCopy);
++
++    D3D12_TEXTURE_COPY_LOCATION dst = {};
++    dst.pResource       = pReadback;
++    dst.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    dst.PlacedFootprint = layout;
++    D3D12_TEXTURE_COPY_LOCATION src = {};
++    src.pResource        = pSrc;
++    src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    src.SubresourceIndex = 0;
++    pCmdList->GetImpl()->DX12CmdList()->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++    Barrier toOrig = Barrier::Transition(pRes, ResourceState::CopySource, origState);
++    ResourceBarrier(pCmdList, 1, &toOrig);
++
++    // Submit and block until the copy is done.
++    ID3D12Fence* pFence = nullptr;
++    pDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFence));
++    pCmdList->GetImpl()->DX12CmdList()->Close();
++    ID3D12CommandList*  lists[] = { pCmdList->GetImpl()->DX12CmdList() };
++    ID3D12CommandQueue* pQueue  = GetDevice()->GetImpl()->DX12CmdQueue(CommandQueue::Graphics);
++    pQueue->ExecuteCommandLists(1, lists);
++    pQueue->Signal(pFence, 1);
++    HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++    pFence->SetEventOnCompletion(1, ev);
++    WaitForSingleObject(ev, INFINITE);
++    CloseHandle(ev);
++    pFence->Release();
++
++    // Map, de-pad rows (readback RowPitch is 256-aligned), write tight raw bytes.
++    // Byte layout comes from GetCopyableFootprints (rowSizeInBytes), which
++    // handles every DX12 format including depth -- unlike GetResourceFormatStride.
++    const uint32_t width    = (uint32_t)fromDesc.Width;
++    const uint32_t height   = (uint32_t)fromDesc.Height;
++    const uint32_t tightRow = (uint32_t)rowSizeInBytes;
++    const uint32_t stride   = width ? (uint32_t)(rowSizeInBytes / width) : 0;
++
++    uint8_t*    pMapped = nullptr;
++    D3D12_RANGE readRange{ 0, (SIZE_T)totalBytes };
++    if (SUCCEEDED(pReadback->Map(0, &readRange, reinterpret_cast<void**>(&pMapped))))
++    {
++        std::ofstream out(binPath, std::ios::binary);
++        for (uint32_t y = 0; y < height; ++y)
++            out.write(reinterpret_cast<const char*>(pMapped + (size_t)y * layout.Footprint.RowPitch), tightRow);
++        pReadback->Unmap(0, nullptr);
++
++        int         channels = 0;
++        std::string dtype;
++        DescribeDxgiFormat(fromDesc.Format, channels, dtype);
++        char fld[256];
++        snprintf(fld, sizeof(fld),
++                 "{\"w\": %u, \"h\": %u, \"channels\": %d, \"dtype\": \"%s\", \"stride\": %u}",
++                 width, height, channels, dtype.c_str(), stride);
++        outMetaFields = fld;
++    }
++
++    GetDevice()->FlushAllCommandQueues();
++    pReadback->Release();
++    delete pCmdList;
++#endif
++}
++
+ void FSRRenderModule::OnResize(const ResolutionInfo& resInfo)
+ {
+     if (!ModuleEnabled())
+@@ -1240,6 +1529,10 @@ void FSRRenderModule::Execute(double deltaTime, CommandList* pCmdList)
+         ResourceBarrier(pCmdList, static_cast<uint32_t>(barriers.size()), barriers.data());
+     }
+ 
++    // FSR-Mamba: snapshot depth & motion now, while they are valid FSR inputs.
++    if (m_CaptureEnabled)
++        CaptureCopyInputs(pCmdList);
++
+     // Note, inverted depth and display mode are currently handled statically for the run of the sample.
+     // If they become changeable at runtime, we'll need to modify how this information is queried
+     static bool s_InvertedDepth = GetConfig()->InvertedDepth;
+diff --git a/samples/fsrapi/fsrapirendermodule.h b/samples/fsrapi/fsrapirendermodule.h
+index 048fb67..a77d675 100644
+--- a/samples/fsrapi/fsrapirendermodule.h
++++ b/samples/fsrapi/fsrapirendermodule.h
+@@ -98,6 +98,22 @@ public:
+      */
+     void ClearReInit() { m_NeedReInit = false; }
+ 
++    // --- FSR-Mamba training-data capture ---------------------------------
++    // Dumps the FSR upscaler's per-frame inputs (LR color, depth, motion
++    // vectors) and its HR output to raw files, for training the PyTorch
++    // accumulator. Driven by env vars so no config edits are needed:
++    //   FSRMAMBA_CAPTURE_DIR    output directory; if set+non-empty, enables it
++    //   FSRMAMBA_CAPTURE_START  frames to skip first (FSR converge), default 8
++    //   FSRMAMBA_CAPTURE_COUNT  frames to capture, default 32
++    // Capture runs in OnPreFrame(), a frame boundary where all four resources
++    // hold the *same* completed frame and no frame command list is pending.
++    void CaptureInit();
++    void CaptureFrame();
++    // Synchronous GPU->CPU readback of one texture into a tight-packed raw file
++    // plus a sidecar describing its dims/format. Adapted from
++    // SwapChainInternal::DumpSwapChainToFile.
++    void DumpTextureRaw(const cauldron::Texture* pTex, const std::string& binPath, std::string& outMetaFields);
++
+     void SetFilter(int32_t method)
+     {
+         m_UpscaleMethod = method;
+@@ -268,6 +284,22 @@ private:
+     uint32_t m_HybridSpinTime;
+     bool m_AllowWaitForSingleObjectOnFence;
+     FfxApiSwapchainFramePacingTuning framePacingTuning;
++
++    // --- FSR-Mamba capture state ---
++    bool        m_CaptureEnabled     = false;
++    uint32_t    m_CaptureStart       = 8;
++    uint32_t    m_CaptureCount       = 32;
++    uint64_t    m_CaptureFrameSeen   = 0;   // OnPreFrame calls seen while enabled
++    uint32_t    m_CaptureWritten     = 0;   // frames actually dumped
++    std::string m_CaptureDir;
++    // Persistent copies of depth/motion, populated in Execute() while those
++    // targets are still valid FSR inputs. The live GBuffer targets are transient
++    // and read back empty at OnPreFrame; a stable copy (as color already does via
++    // m_pTempTexture) is the only coherent way to capture them. Copy is recorded
++    // on the frame command list, so the capture holds the same frame as color.
++    const cauldron::Texture* m_pCaptureDepth  = nullptr;
++    const cauldron::Texture* m_pCaptureMotion = nullptr;
++    void CaptureCopyInputs(cauldron::CommandList* pCmdList);
+ };
+ 
+ // alias to get sample.cpp to use this class.
