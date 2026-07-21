@@ -1,34 +1,58 @@
 diff --git a/framework/cauldron/framework/src/core/components/cameracomponent.cpp b/framework/cauldron/framework/src/core/components/cameracomponent.cpp
-index 6c554ab..4d21e3a 100644
+index 6c554ab..f9bde76 100644
 --- a/framework/cauldron/framework/src/core/components/cameracomponent.cpp
 +++ b/framework/cauldron/framework/src/core/components/cameracomponent.cpp
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,8 @@
  #include "misc/math.h"
  
  #include<algorithm>
 +#include <cstdlib>   // FSR-Mamba: getenv/atof for the capture auto-orbit
++#include <chrono>    // FSR-Mamba: warmup gate for the auto-orbit
  
  namespace cauldron
  {
-@@ -291,7 +292,22 @@ namespace cauldron
+@@ -291,7 +293,45 @@ namespace cauldron
                      m_Pitch += inputState.GetMouseAxisDelta(Mouse_YAxis) / 100.f;
                      hasRotation = true;
                  }
 -                
 +
-+                // FSR-Mamba: programmatic arc-ball orbit for unattended capture --
++                // FSR-Mamba: programmatic camera pan for unattended capture --
 +                // implements the "Support camera animations" TODO above. Env var
-+                // FSRMAMBA_CAMERA_ORBIT gives yaw radians/frame (e.g. 0.005). This
-+                // gives the whole frame consistent motion vectors without a human
-+                // flying the camera, so capture can run across every scene.
++                // FSRMAMBA_CAMERA_ORBIT gives yaw radians/frame (e.g. 0.006), so
++                // every frame has consistent motion vectors with no one flying the
++                // camera. Two guards keep the interesting interior in frame:
++                //   * it does not start until FSRMAMBA_CAPTURE_WARMUP_SEC has
++                //     elapsed -- otherwise it would spin for the whole (long)
++                //     asset-streaming warmup and drift out to the building
++                //     exterior before capture even begins, and
++                //   * it reverses direction periodically, panning back and forth
++                //     within a bounded arc around the start view instead of
++                //     orbiting all the way around and out of the scene.
 +                static const float s_autoOrbit = []() {
 +                    const char* s = std::getenv("FSRMAMBA_CAMERA_ORBIT");
 +                    return s ? static_cast<float>(std::atof(s)) : 0.f;
 +                }();
 +                if (s_autoOrbit != 0.f)
 +                {
-+                    m_Yaw += s_autoOrbit;
-+                    hasRotation = true;
++                    static const double s_warmup = []() {
++                        const char* w = std::getenv("FSRMAMBA_CAPTURE_WARMUP_SEC");
++                        return w ? std::atof(w) : 0.0;
++                    }();
++                    static const auto s_t0 = std::chrono::steady_clock::now();
++                    const double elapsed = std::chrono::duration<double>(
++                        std::chrono::steady_clock::now() - s_t0).count();
++                    if (elapsed >= s_warmup)
++                    {
++                        // Reverse every kHalfCycle frames -> bounded excursion of
++                        // kHalfCycle * s_autoOrbit radians around the start view.
++                        static long s_panFrame = 0;
++                        const long kHalfCycle = 25;  // ~0.15 rad (9 deg) at 0.006
++                        const float dir = ((s_panFrame / kHalfCycle) % 2 == 0) ? 1.f : -1.f;
++                        m_Yaw += s_autoOrbit * dir;
++                        ++s_panFrame;
++                        hasRotation = true;
++                    }
 +                }
 +
                  // If hitting the 'r' key or back button on game pad, reset camera to original transform
