@@ -61,12 +61,25 @@ launched via a shell that resolves the current directory (Git Bash
 search the working directory for exes.
 
 `FSRMAMBA_CAMERA_ORBIT` implements the framework's own commented-out
-"Support camera animations" TODO in `CameraComponent::Update()`: it adds a small
-yaw increment to the arc-ball camera every frame, giving the whole frame
-consistent motion vectors without anyone flying the camera. `0.006` rad/frame is
-a gentle, realistic pan; larger values move faster (keep it small enough that
-FSR's history reprojection stays valid). This is why the patch also touches
-`framework/.../cameracomponent.cpp`.
+"Support camera animations" TODO in `CameraComponent::Update()`: it pans the
+arc-ball camera automatically, giving the whole frame consistent motion vectors
+without anyone flying it. `0.006` rad/frame is a gentle, realistic pan; larger
+values move faster (keep it small enough that FSR's history reprojection stays
+valid). This is why the patch also touches `framework/.../cameracomponent.cpp`.
+
+Two guards keep the *interesting* content in frame:
+
+- The pan **does not start until `FSRMAMBA_CAPTURE_WARMUP_SEC` has elapsed.**
+  Otherwise it would spin for the whole (long) asset-streaming warmup and drift
+  out of the scene — e.g. from Sponza's detailed interior out to the plain brick
+  exterior — before capture even begins.
+- It **reverses direction periodically** (every ~25 frames), panning back and
+  forth within a bounded arc (~9° at `0.006`) around the start view instead of
+  orbiting all the way around and out.
+
+Note: the **first captured frame has zero motion** — it is the sequence's seed
+frame, whose previous frame was the static warmup. This is correct; a recurrent
+accumulator initialises on frame 0 with no history regardless.
 
 ## Two things learned the hard way (both now have built-in fixes)
 
