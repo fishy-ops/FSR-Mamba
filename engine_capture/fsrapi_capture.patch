@@ -59,7 +59,7 @@ index 6c554ab..f9bde76 100644
                  if (inputState.GetKeyState(Key_R) || inputState.GetGamePadButtonState(Pad_Back))
                  {
 diff --git a/samples/fsrapi/fsrapirendermodule.cpp b/samples/fsrapi/fsrapirendermodule.cpp
-index 36649fe..5baae12 100644
+index 36649fe..a1964fb 100644
 --- a/samples/fsrapi/fsrapirendermodule.cpp
 +++ b/samples/fsrapi/fsrapirendermodule.cpp
 @@ -22,6 +22,12 @@
@@ -99,7 +99,7 @@ index 36649fe..5baae12 100644
      if (NeedsReInit())
      {
          GetDevice()->FlushAllCommandQueues();
-@@ -1176,6 +1192,297 @@ void FSRRenderModule::OnPreFrame()
+@@ -1176,6 +1192,338 @@ void FSRRenderModule::OnPreFrame()
      }
  }
  
@@ -157,6 +157,40 @@ index 36649fe..5baae12 100644
 +    // count elapses long before the scene is actually drawn.
 +    if (const char* w = std::getenv("FSRMAMBA_CAPTURE_WARMUP_SEC")) m_WarmupSec = std::atof(w);
 +
++    // Upscaler override so both passes can be captured without touching the UI,
++    // and independent of any persisted UI state (which was silently leaving the
++    // "FSR" pass at 1.0x = no upscaling). Set before Init's SwitchUpscaler().
++    //   FSRMAMBA_UPSCALER=native  render at full display res (no upscaling) ->
++    //                             m_pColorTarget is the ground-truth reference.
++    //   FSRMAMBA_UPSCALER=fsr     FSR upscaling; the scale preset is forced too
++    //                             so the baseline actually upscales.
++    // Optional FSRMAMBA_SCALE selects the FSR preset by ratio: 1.5|1.7|2|3
++    // (default 2 = Performance).
++    if (const char* u = std::getenv("FSRMAMBA_UPSCALER"))
++    {
++        const std::string mode = u;
++        if (mode == "native")
++        {
++            m_UiUpscaleMethod = m_UpscaleMethod = Upscaler_Native;
++        }
++        else if (mode == "fsr")
++        {
++            m_UiUpscaleMethod = m_UpscaleMethod = Upscaler_FSRAPI;
++            FSRScalePreset preset = FSRScalePreset::Performance;  // 2.0x default
++            if (const char* sc = std::getenv("FSRMAMBA_SCALE"))
++            {
++                const double r = std::atof(sc);
++                if      (r >= 2.9) preset = FSRScalePreset::UltraPerformance;
++                else if (r >= 1.95) preset = FSRScalePreset::Performance;
++                else if (r >= 1.65) preset = FSRScalePreset::Balanced;
++                else                preset = FSRScalePreset::Quality;  // 1.5x
++            }
++            m_CurScale = m_ScalePreset = preset;
++        }
++        std::wstring wmode(mode.begin(), mode.end());
++        cauldron::Log::Write(LOGLEVEL_INFO, L"[FSR-Mamba] upscaler forced: %ls", wmode.c_str());
++    }
++
 +    // The output directory is created by the launch script before the app
 +    // starts (see run_capture in the harness), so no filesystem calls here --
 +    // the framework targets the C++14/17 boundary and std::filesystem is not
@@ -165,6 +199,13 @@ index 36649fe..5baae12 100644
 +    m_CaptureEnabled   = true;
 +    m_CaptureFrameSeen = 0;
 +    m_CaptureWritten   = 0;
++
++    // Frame generation is ON by default and inserts *interpolated* frames that
++    // are not true rendered frames -- they have no clean ground truth and would
++    // pollute the capture. Force it off for every capture run. This flows to
++    // EnableFrameInterpolation() via UpdatePreset() during Init's mode switch.
++    m_FrameInterpolation = false;
++    m_OfUiEnabled        = false;
 +
 +    // Persistent copy targets for depth & motion, display-sized like the color
 +    // target. Depth is stored as R32_FLOAT (copy-compatible with the D32/R32
@@ -397,7 +438,7 @@ index 36649fe..5baae12 100644
  void FSRRenderModule::OnResize(const ResolutionInfo& resInfo)
  {
      if (!ModuleEnabled())
-@@ -1240,6 +1547,10 @@ void FSRRenderModule::Execute(double deltaTime, CommandList* pCmdList)
+@@ -1240,6 +1588,10 @@ void FSRRenderModule::Execute(double deltaTime, CommandList* pCmdList)
          ResourceBarrier(pCmdList, static_cast<uint32_t>(barriers.size()), barriers.data());
      }
  

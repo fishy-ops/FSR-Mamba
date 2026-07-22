@@ -41,6 +41,10 @@ FSRMAMBA_CAPTURE_WARMUP_SEC  wall-clock seconds to wait before capturing (defaul
 FSRMAMBA_CAPTURE_START       frames to skip before capturing (default 8)
 FSRMAMBA_CAPTURE_COUNT       frames to capture (default 32)
 FSRMAMBA_CAMERA_ORBIT        yaw radians/frame for the auto-orbit (default 0 = off)
+FSRMAMBA_UPSCALER            "fsr" (upscale) or "native" (ground truth). Forces the
+                             upscaler Method + scale preset, overriding any UI/
+                             persisted state. Frame generation is forced off.
+FSRMAMBA_SCALE               FSR upscale ratio: 1.5 | 1.7 | 2 | 3 (default 2)
 ```
 
 Fully unattended capture — no human at the keyboard — looks like:
@@ -80,6 +84,38 @@ Two guards keep the *interesting* content in frame:
 Note: the **first captured frame has zero motion** — it is the sequence's seed
 frame, whose previous frame was the static warmup. This is correct; a recurrent
 accumulator initialises on frame 0 with no history regardless.
+
+## Ground truth (paired capture)
+
+Engine capture gives FSR's *output*, which is the baseline to beat, not a
+training target. The sample can also render at full display resolution with no
+upscaling (`FSRMAMBA_UPSCALER=native`) — that native render is the reference the
+upscaler is trying to reconstruct, i.e. the ground truth.
+
+Capture each scene **twice** with the *same deterministic camera* (fixed
+`WARMUP_SEC` + frame-counted pan), so frame *i* is the same viewpoint in both:
+
+```bash
+# FSR baseline pass (low-res input + motion + depth + FSR output)
+FSRMAMBA_UPSCALER=fsr    FSRMAMBA_SCALE=2 ... ./FFX_API_FSR_DX12.exe   # -> sponza_fsr/
+# Ground-truth pass (native full-res render)
+FSRMAMBA_UPSCALER=native               ... ./FFX_API_FSR_DX12.exe      # -> sponza_gt/
+```
+
+Then `frame_i` of `sponza_fsr` (input + FSR's answer) pairs with `frame_i` of
+`sponza_gt` (the correct answer). Training target = GT; scoring = FSR-baseline
+vs learned-model, both against GT.
+
+Sanity check on Sponza (2x, tonemapped): FSR output vs native GT is **27.7 dB /
+0.913 SSIM**, per-frame PSNR range 26.9–28.3. The tight range confirms the two
+passes are frame-aligned; 27.7 dB is the baseline the learned accumulator must
+beat.
+
+Both `FSRMAMBA_UPSCALER` and `FSRMAMBA_SCALE` **force** the Method and scale
+preset at startup, overriding any UI or persisted state — the sample otherwise
+remembers a manual Method change and can silently leave the "FSR" pass at 1.0x
+(no upscaling). Frame generation is forced off during capture: it inserts
+*interpolated* frames that are not true renders and have no ground truth.
 
 ## Two things learned the hard way (both now have built-in fixes)
 
