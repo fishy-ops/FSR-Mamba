@@ -43,8 +43,20 @@ def _tonemap(x: torch.Tensor) -> torch.Tensor:
     return x / (1.0 + x)
 
 
-def load_engine_scene(scene_dir: str, device: str = "cpu", tonemap: bool = True) -> list[dict]:
-    """Load one scene's paired capture (``<scene>/fsr`` + ``<scene>/gt``)."""
+def load_engine_scene(scene_dir: str, device: str = "cpu", tonemap: bool = True,
+                      cache: bool = True) -> list[dict]:
+    """Load one scene's paired capture (``<scene>/fsr`` + ``<scene>/gt``).
+
+    Decoding the packed rg11b10 HDR color is CPU-heavy (~17 s/scene), so the
+    decoded frames are cached as float16 next to the capture and reused. Delete
+    the ``_cache_*.pt`` files to force a re-decode.
+    """
+    cache_path = os.path.join(scene_dir, f"_cache_tm{int(tonemap)}.pt")
+    if cache and os.path.exists(cache_path):
+        data = torch.load(cache_path, map_location="cpu", weights_only=True)
+        return [{k: (v.float().to(device) if torch.is_tensor(v) else v) for k, v in f.items()}
+                for f in data]
+
     fsr = sorted(glob.glob(os.path.join(scene_dir, "fsr", "frame_*.json")))
     gt = sorted(glob.glob(os.path.join(scene_dir, "gt", "frame_*.json")))
     if not fsr or not gt:
@@ -66,14 +78,19 @@ def load_engine_scene(scene_dir: str, device: str = "cpu", tonemap: bool = True)
         # at output res, but upsampling every full frame and holding it in RAM is
         # ~4x the memory and slow -- crop_sequence upsamples only the small crop.
         frames.append({
-            "lr": lr.to(device),                 # render resolution
-            "mv": f["mv"].to(device),            # render resolution
-            "depth": f["depth"].to(device),      # render resolution
-            "gt": gt_img.to(device),             # output resolution
-            "fsr_out": fsr_out.to(device),       # actual FSR 3.1.4 output, the number to beat
+            "lr": lr,                 # render resolution
+            "mv": f["mv"],            # render resolution
+            "depth": f["depth"],      # render resolution
+            "gt": gt_img,             # output resolution
+            "fsr_out": fsr_out,       # actual FSR 3.1.4 output, the number to beat
             "jitter": f["jitter"],
         })
-    return frames
+
+    if cache:
+        half = [{k: (v.half() if torch.is_tensor(v) else v) for k, v in f.items()} for f in frames]
+        torch.save(half, cache_path)
+
+    return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in f.items()} for f in frames]
 
 
 def crop_sequence(frames: list[dict], crop_render: int, scale: int = 2,
