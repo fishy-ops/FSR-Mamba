@@ -23,6 +23,8 @@ failure the whole project is meant to avoid.
 from __future__ import annotations
 
 import argparse
+import pathlib
+import random
 import time
 
 import torch
@@ -32,6 +34,7 @@ from fsrmamba.baseline import FSRAccumulator, FSRState
 from fsrmamba.mamba import MambaAccumulator, MambaState
 from fsrmamba.metrics import psnr, ssim, temporal_instability
 from fsrmamba.synth import halton_jitter, random_scene
+from fsrmamba.engine_data import crop_sequence, list_scenes, load_engine_scene
 
 
 def render_sequence(scene, n_frames, render_size, out_size, gt_ss):
@@ -97,6 +100,149 @@ def evaluate(model, frames, out_size, state_channels):
     return tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)
 
 
+def evaluate_captured(frames) -> tuple[float, float, float]:
+    """Baseline metrics from the *captured* FSR output vs ground truth.
+
+    In engine mode the baseline is the real FSR 3.1.4 output we captured, not the
+    ported accumulator -- so this just scores frames["fsr_out"] against the GT.
+    """
+    tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+    n_ti = 0
+    prev = None
+    for f in frames:
+        tot["psnr"] += psnr(f["fsr_out"], f["gt"])
+        tot["ssim"] += ssim(f["fsr_out"], f["gt"])
+        if prev is not None:
+            tot["ti"] += temporal_instability(f["fsr_out"], prev, f["mv"])
+            n_ti += 1
+        prev = f["fsr_out"]
+    n = len(frames)
+    return tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)
+
+
+def train_engine(args) -> None:
+    """Train on captured engine data: (LR, motion, depth) -> ground truth.
+
+    Holds out whole scenes for validation (same discipline as the synthetic
+    path). Trains on fixed random crops -- full 1080p BPTT will not fit in 8 GB,
+    and crop_sequence rescales the motion vectors to crop-local UV. The baseline
+    is the captured FSR output, scored on the same held-out crops.
+    """
+    dev = torch.device(args.device)
+    crop_r = args.crop
+    crop_o = crop_r * int(args.scale)
+    render_size = (crop_r, crop_r)
+    out_size = (crop_o, crop_o)
+
+    scenes = list_scenes(args.engine_data)
+    if len(scenes) < 2:
+        raise SystemExit(f"need >=2 scenes in {args.engine_data}, found {scenes}")
+    n_val = max(1, args.val_scenes)
+    val_names, train_names = scenes[:n_val], scenes[n_val:]
+    print(f"engine data: {len(train_names)} train / {len(val_names)} val scenes")
+    print(f"  train: {train_names}")
+    print(f"  val:   {val_names}")
+    print(f"crop render {crop_r}x{crop_r} -> out {crop_o}x{crop_o}")
+
+    # Full sequences stay on CPU; crops move to the GPU per use (1080p x all
+    # scenes will not fit in VRAM, but a crop is tiny).
+    t0 = time.time()
+    train_full = [load_engine_scene(f"{args.engine_data}/{s}", device="cpu") for s in train_names]
+    val_full = [load_engine_scene(f"{args.engine_data}/{s}", device="cpu") for s in val_names]
+    print(f"  loaded in {time.time()-t0:.1f}s")
+
+    def to_dev(seq):
+        return [{k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in f.items()} for f in seq]
+
+    # Fixed val crops (seeded) so the baseline and every epoch score the same pixels.
+    val_crops = [to_dev(crop_sequence(s, crop_r, int(args.scale), random.Random(1000 + i)))
+                 for i, s in enumerate(val_full)]
+
+    def eval_model():
+        # Self-contained (device-aware) eval so it does not depend on the shared
+        # evaluate() helper, which builds CPU state on this branch.
+        model.eval()
+        results = []
+        with torch.no_grad():
+            for frames in val_crops:
+                state = MambaState.zeros(out_size, args.state_channels, device=dev)
+                prev_out, prev_depth = None, None
+                tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+                n_ti = 0
+                for f in frames:
+                    out, state = model(state, f["lr"], f["mv"], f["depth"], f["jitter"],
+                                       prev_depth_hr=prev_depth)
+                    prev_depth = f["depth"]
+                    tot["psnr"] += psnr(out, f["gt"])
+                    tot["ssim"] += ssim(out, f["gt"])
+                    if prev_out is not None:
+                        tot["ti"] += temporal_instability(out, prev_out, f["mv"])
+                        n_ti += 1
+                    prev_out = out
+                n = len(frames)
+                results.append((tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)))
+        return tuple(sum(v) / len(results) for v in zip(*results))
+
+    b_psnr, b_ssim, b_ti = (sum(v) / len(val_crops)
+                            for v in zip(*[evaluate_captured(s) for s in val_crops]))
+    print(f"\nFSR (captured) PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
+
+    model = MambaAccumulator(render_size, out_size, state_channels=args.state_channels,
+                             num_experts=args.num_experts, device=dev)
+    print(f"learned model  {sum(p.numel() for p in model.parameters()):,} parameters, "
+          f"{args.num_experts} expert(s)\n")
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
+        for full in train_full:
+            seq = to_dev(crop_sequence(full, crop_r, int(args.scale)))  # fresh crop = augmentation
+            state = MambaState.zeros(out_size, args.state_channels, device=dev)
+            prev_out, prev_depth, prev_gt = None, None, None
+            for start in range(0, len(seq), args.bptt):
+                window = seq[start:start + args.bptt]
+                if not window:
+                    continue
+                opt.zero_grad()
+                loss = torch.zeros((), device=dev)
+                for f in window:
+                    out, state = model(state, f["lr"], f["mv"], f["depth"], f["jitter"],
+                                       prev_depth_hr=prev_depth)
+                    prev_depth = f["depth"]
+                    loss = loss + F.l1_loss(out, f["gt"])
+                    if prev_out is not None:
+                        d_out = out - warp_prev(prev_out.detach(), f["mv"])
+                        d_gt = f["gt"] - warp_prev(prev_gt, f["mv"])
+                        loss = loss + args.temporal_weight * F.l1_loss(d_out, d_gt)
+                    if args.num_experts > 1 and args.balance_weight > 0:
+                        loss = loss + args.balance_weight * model.load_balance_loss()
+                    prev_out, prev_gt = out, f["gt"]
+                loss = loss / len(window)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                epoch_loss += loss.item()
+                state = state.detach()
+                prev_out = prev_out.detach()
+
+        if epoch % 2 == 0 or epoch == args.epochs - 1:
+            model.eval()
+            p, s, ti = eval_model()
+            flag = "  <-- beats FSR on both" if (p > b_psnr and ti < b_ti) else ""
+            print(f"epoch {epoch:3d}  loss {epoch_loss:7.4f}   "
+                  f"PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}{flag}")
+
+    print("\n--- final (engine data, held-out scenes) ---")
+    print(f"FSR (captured) PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
+    p, s, ti = eval_model()
+    print(f"learned        PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
+    if args.save:
+        pathlib.Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), args.save)
+        print(f"saved {args.save}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=20)
@@ -115,7 +261,14 @@ def main() -> None:
     ap.add_argument("--num-experts", type=int, default=1)
     ap.add_argument("--save", type=str, default="")
     ap.add_argument("--balance-weight", type=float, default=0.01)
+    ap.add_argument("--engine-data", type=str, default="",
+                    help="captures dir (<scene>/{fsr,gt}); trains on real engine data vs GT")
+    ap.add_argument("--crop", type=int, default=128, help="render-res train crop (engine mode)")
     args = ap.parse_args()
+
+    if args.engine_data:
+        train_engine(args)
+        return
 
     out_size = (args.height, args.width)
     render_size = (int(args.height / args.scale), int(args.width / args.scale))
