@@ -154,37 +154,47 @@ def train_engine(args) -> None:
     def to_dev(seq):
         return [{k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in f.items()} for f in seq]
 
-    # Fixed val crops (seeded) so the baseline and every epoch score the same pixels.
-    val_crops = [to_dev(crop_sequence(s, crop_r, int(args.scale), random.Random(1000 + i)))
-                 for i, s in enumerate(val_full)]
+    # Multiple seeded crops per val scene -> a robust average instead of one
+    # lucky crop. Kept on CPU; each is moved to the GPU only while it is scored.
+    val_crops = []
+    for i, s in enumerate(val_full):
+        for k in range(args.eval_crops):
+            val_crops.append(crop_sequence(s, crop_r, int(args.scale),
+                                           random.Random(1000 + i * 1000 + k)))
+    print(f"eval: {args.eval_crops} crops x {len(val_full)} val scenes = {len(val_crops)} sequences")
+
+    def _score(frames_cpu, run_model):
+        """Score one crop sequence. run_model=None -> captured FSR baseline."""
+        frames = to_dev(frames_cpu)
+        state = MambaState.zeros(out_size, args.state_channels, device=dev) if run_model else None
+        prev_out, prev_depth = None, None
+        tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+        n_ti = 0
+        for f in frames:
+            if run_model is not None:
+                out, state = run_model(state, f["lr"], f["mv"], f["depth"], f["jitter"],
+                                       prev_depth_hr=prev_depth)
+                prev_depth = f["depth"]
+            else:
+                out = f["fsr_out"]
+            tot["psnr"] += psnr(out, f["gt"])
+            tot["ssim"] += ssim(out, f["gt"])
+            if prev_out is not None:
+                tot["ti"] += temporal_instability(out, prev_out, f["mv"])
+                n_ti += 1
+            prev_out = out
+        n = len(frames)
+        return (tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti))
 
     def eval_model():
-        # Self-contained (device-aware) eval so it does not depend on the shared
-        # evaluate() helper, which builds CPU state on this branch.
         model.eval()
-        results = []
         with torch.no_grad():
-            for frames in val_crops:
-                state = MambaState.zeros(out_size, args.state_channels, device=dev)
-                prev_out, prev_depth = None, None
-                tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
-                n_ti = 0
-                for f in frames:
-                    out, state = model(state, f["lr"], f["mv"], f["depth"], f["jitter"],
-                                       prev_depth_hr=prev_depth)
-                    prev_depth = f["depth"]
-                    tot["psnr"] += psnr(out, f["gt"])
-                    tot["ssim"] += ssim(out, f["gt"])
-                    if prev_out is not None:
-                        tot["ti"] += temporal_instability(out, prev_out, f["mv"])
-                        n_ti += 1
-                    prev_out = out
-                n = len(frames)
-                results.append((tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)))
-        return tuple(sum(v) / len(results) for v in zip(*results))
+            rs = [_score(c, model) for c in val_crops]
+        return tuple(sum(v) / len(rs) for v in zip(*rs))
 
-    b_psnr, b_ssim, b_ti = (sum(v) / len(val_crops)
-                            for v in zip(*[evaluate_captured(s) for s in val_crops]))
+    with torch.no_grad():
+        rs = [_score(c, None) for c in val_crops]
+    b_psnr, b_ssim, b_ti = (sum(v) / len(rs) for v in zip(*rs))
     print(f"\nFSR (captured) PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
 
     model = MambaAccumulator(render_size, out_size, state_channels=args.state_channels,
@@ -192,6 +202,8 @@ def train_engine(args) -> None:
     print(f"learned model  {sum(p.numel() for p in model.parameters()):,} parameters, "
           f"{args.num_experts} expert(s)\n")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.05)
+    best_psnr = -1.0
 
     for epoch in range(args.epochs):
         model.train()
@@ -225,22 +237,27 @@ def train_engine(args) -> None:
                 epoch_loss += loss.item()
                 state = state.detach()
                 prev_out = prev_out.detach()
+        sched.step()
 
         if epoch % 2 == 0 or epoch == args.epochs - 1:
-            model.eval()
             p, s, ti = eval_model()
-            flag = "  <-- beats FSR on both" if (p > b_psnr and ti < b_ti) else ""
-            print(f"epoch {epoch:3d}  loss {epoch_loss:7.4f}   "
-                  f"PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}{flag}")
+            gap = p - b_psnr
+            flag = "  <-- beats FSR" if gap > 0 else ""
+            print(f"epoch {epoch:3d}  loss {epoch_loss:7.4f}  lr {sched.get_last_lr()[0]:.1e}   "
+                  f"PSNR {p:6.2f} ({gap:+.2f} vs FSR)  SSIM {s:.4f}  temporal {ti:.5f}{flag}")
+            if p > best_psnr:
+                best_psnr = p
+                if args.save:
+                    pathlib.Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), args.save)
 
-    print("\n--- final (engine data, held-out scenes) ---")
-    print(f"FSR (captured) PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
+    print("\n--- final (engine data, held-out scenes, multi-crop) ---")
+    print(f"FSR (captured)   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
     p, s, ti = eval_model()
-    print(f"learned        PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
+    print(f"learned (last)   PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
+    print(f"learned (best)   PSNR {best_psnr:6.2f}   gap to FSR {best_psnr - b_psnr:+.2f} dB")
     if args.save:
-        pathlib.Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), args.save)
-        print(f"saved {args.save}")
+        print(f"saved best model to {args.save}")
 
 
 def main() -> None:
@@ -264,6 +281,7 @@ def main() -> None:
     ap.add_argument("--engine-data", type=str, default="",
                     help="captures dir (<scene>/{fsr,gt}); trains on real engine data vs GT")
     ap.add_argument("--crop", type=int, default=128, help="render-res train crop (engine mode)")
+    ap.add_argument("--eval-crops", type=int, default=8, help="seeded crops per val scene (engine mode)")
     args = ap.parse_args()
 
     if args.engine_data:
