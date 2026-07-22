@@ -117,6 +117,42 @@ remembers a manual Method change and can silently leave the "FSR" pass at 1.0x
 (no upscaling). Frame generation is forced off during capture: it inserts
 *interpolated* frames that are not true renders and have no ground truth.
 
+## Capturing the whole dataset
+
+`capture_scenes.py` runs both passes across every scene that ships with a camera,
+into `<out>/<scene>/{fsr,gt}/`:
+
+```bash
+..\.venv\Scripts\python capture_scenes.py --out D:/FSR-Mamba/captures
+..\.venv\Scripts\python capture_scenes.py --scenes sponza bistro   # subset
+```
+
+Per scene it rewrites `fsrapiconfig.json` to load that scene's glTF and its
+artist-placed camera (extracted from the glTF), strips the Sponza-positioned
+particle spawners, runs the FSR and GT passes, and restores the original config
+at the end. It also raises `DynamicBufferPoolSize` in `cauldronconfig.json` (see
+below) and renders at **1920x1080** (`-resolution`, matching the project scope:
+1080p output / 540p render at 2x).
+
+Result across 10 scenes (Sponza, Bistro, Brutalism, Chess, Hangar,
+HybridReflections, Locomotive, MiniatureTable, SpaceShip, Toyshop): all captured
+completely. FSR-2x-vs-GT baseline ranges 20 dB (chess, reflective) to 42 dB
+(toyshop), **mean 32.5 dB** — the number a learned accumulator must beat.
+
+MetalRoughSpheres and the animated Toyshop are skipped: they embed no camera, and
+the framework's default camera is hardcoded to a Sponza-ish position.
+
+## Heavy scenes: raise the dynamic buffer pool, it is NOT VRAM
+
+Complex scenes (Bistro, Brutalism) overflow the framework's **dynamic buffer
+pool** -- a *fixed-size, CPU-side* ring buffer for per-draw constant buffers,
+default 75 MB in `cauldronconfig.json`. Overflow fires a critical assert
+("DynamicBufferPool has run out of memory. Please increase the allocation size")
+and hangs the app on a modal dialog. This looks like an out-of-memory crash but
+**VRAM stays low** -- it is the pool, not the GPU. Fix: raise
+`Allocations.DynamicBufferPoolSize` (the orchestrator sets 512 MB). It is
+system-RAM-backed upload memory, so a large value is cheap.
+
 ## Two things learned the hard way (both now have built-in fixes)
 
 1. **Wait for the scene to load — in wall-clock time, not frames.** Capturing
