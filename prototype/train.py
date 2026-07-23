@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 from fsrmamba.baseline import FSRAccumulator, FSRState
 from fsrmamba.mamba import MambaAccumulator, MambaState
-from fsrmamba.metrics import psnr, ssim, temporal_instability
+from fsrmamba.metrics import gradient_l1, psnr, ssim, ssim_map_mean, temporal_instability
 from fsrmamba.synth import halton_jitter, random_scene
 from fsrmamba.engine_data import crop_sequence, list_scenes, load_engine_scene
 
@@ -198,12 +198,24 @@ def train_engine(args) -> None:
     print(f"\nFSR (captured) PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
 
     model = MambaAccumulator(render_size, out_size, state_channels=args.state_channels,
+                             feature_channels=args.feature_channels,
                              num_experts=args.num_experts, device=dev)
     print(f"learned model  {sum(p.numel() for p in model.parameters()):,} parameters, "
           f"{args.num_experts} expert(s)\n")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.05)
-    best_psnr = -1.0
+    # Linear warmup then cosine. A bigger model at full LR from step 0 can diverge
+    # to a degenerate constant output early and never recover -- the warmup avoids
+    # that.
+    warmup = max(1, args.epochs // 15)
+    sched = torch.optim.lr_scheduler.SequentialLR(
+        opt,
+        [torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.02, total_iters=warmup),
+         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs - warmup),
+                                                    eta_min=args.lr * 0.05)],
+        milestones=[warmup],
+    )
+    best_score = -1e9
+    best_metrics = (0.0, 0.0, 0.0)
 
     for epoch in range(args.epochs):
         model.train()
@@ -223,6 +235,10 @@ def train_engine(args) -> None:
                                        prev_depth_hr=prev_depth)
                     prev_depth = f["depth"]
                     loss = loss + F.l1_loss(out, f["gt"])
+                    if args.ssim_weight > 0:
+                        loss = loss + args.ssim_weight * (1.0 - ssim_map_mean(out, f["gt"]))
+                    if args.grad_weight > 0:
+                        loss = loss + args.grad_weight * gradient_l1(out, f["gt"])
                     if prev_out is not None:
                         d_out = out - warp_prev(prev_out.detach(), f["mv"])
                         d_gt = f["gt"] - warp_prev(prev_gt, f["mv"])
@@ -241,12 +257,17 @@ def train_engine(args) -> None:
 
         if epoch % 2 == 0 or epoch == args.epochs - 1:
             p, s, ti = eval_model()
-            gap = p - b_psnr
-            flag = "  <-- beats FSR" if gap > 0 else ""
+            wins = int(p > b_psnr) + int(s > b_ssim) + int(ti < b_ti)
+            flag = "  <-- BEATS FSR on all 3" if wins == 3 else (f"  <-- beats {wins}/3" if wins >= 2 else "")
             print(f"epoch {epoch:3d}  loss {epoch_loss:7.4f}  lr {sched.get_last_lr()[0]:.1e}   "
-                  f"PSNR {p:6.2f} ({gap:+.2f} vs FSR)  SSIM {s:.4f}  temporal {ti:.5f}{flag}")
-            if p > best_psnr:
-                best_psnr = p
+                  f"PSNR {p:6.2f} ({p-b_psnr:+.2f})  SSIM {s:.4f} ({s-b_ssim:+.4f})  "
+                  f"temporal {ti:.5f}{flag}")
+            # Best = composite of PSNR + SSIM (SSIM scaled to dB-comparable range),
+            # so we keep the checkpoint that is strong on both, not just PSNR.
+            score = p + 30.0 * s
+            if score > best_score:
+                best_score = score
+                best_metrics = (p, s, ti)
                 if args.save:
                     pathlib.Path(args.save).parent.mkdir(parents=True, exist_ok=True)
                     torch.save(model.state_dict(), args.save)
@@ -255,7 +276,10 @@ def train_engine(args) -> None:
     print(f"FSR (captured)   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
     p, s, ti = eval_model()
     print(f"learned (last)   PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
-    print(f"learned (best)   PSNR {best_psnr:6.2f}   gap to FSR {best_psnr - b_psnr:+.2f} dB")
+    bp, bs, bti = best_metrics
+    won = int(bp > b_psnr) + int(bs > b_ssim) + int(bti < b_ti)
+    print(f"learned (best)   PSNR {bp:6.2f} ({bp-b_psnr:+.2f})  SSIM {bs:.4f} ({bs-b_ssim:+.4f})  "
+          f"temporal {bti:.5f} ({bti-b_ti:+.5f})  -> beats FSR on {won}/3")
     if args.save:
         print(f"saved best model to {args.save}")
 
@@ -282,6 +306,9 @@ def main() -> None:
                     help="captures dir (<scene>/{fsr,gt}); trains on real engine data vs GT")
     ap.add_argument("--crop", type=int, default=128, help="render-res train crop (engine mode)")
     ap.add_argument("--eval-crops", type=int, default=8, help="seeded crops per val scene (engine mode)")
+    ap.add_argument("--feature-channels", type=int, default=24, help="CNN width (model capacity)")
+    ap.add_argument("--ssim-weight", type=float, default=0.0, help="weight on (1 - SSIM) loss")
+    ap.add_argument("--grad-weight", type=float, default=0.0, help="weight on gradient-L1 (sharpness) loss")
     args = ap.parse_args()
 
     if args.engine_data:
