@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-__all__ = ["psnr", "ssim", "temporal_instability"]
+__all__ = ["psnr", "ssim", "ssim_map_mean", "gradient_l1", "temporal_instability"]
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
@@ -39,8 +39,14 @@ def _gaussian_window(size: int, sigma: float, device) -> torch.Tensor:
     return g.outer(g)
 
 
-def ssim(pred: torch.Tensor, target: torch.Tensor, window: int = 11, sigma: float = 1.5) -> float:
-    """Mean SSIM over the image, averaged across colour channels."""
+def ssim_map_mean(
+    pred: torch.Tensor, target: torch.Tensor, window: int = 11, sigma: float = 1.5
+) -> torch.Tensor:
+    """Mean SSIM as a differentiable tensor (for use in a loss). Inputs (H,W,3).
+
+    Same computation as ``ssim`` but keeps the graph -- ``1 - ssim_map_mean`` is a
+    valid loss term that directly optimises the SSIM the eval reports.
+    """
     x = pred.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
     y = target.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
     c = x.shape[1]
@@ -56,7 +62,27 @@ def ssim(pred: torch.Tensor, target: torch.Tensor, window: int = 11, sigma: floa
 
     c1, c2 = 0.01**2, 0.03**2
     s = ((2 * mu_xy + c1) * (2 * sig_xy + c2)) / ((mu_x2 + mu_y2 + c1) * (sig_x + sig_y + c2))
-    return s.mean().item()
+    return s.mean()
+
+
+def ssim(pred: torch.Tensor, target: torch.Tensor, window: int = 11, sigma: float = 1.5) -> float:
+    """Mean SSIM over the image, averaged across colour channels."""
+    return ssim_map_mean(pred, target, window, sigma).item()
+
+
+def gradient_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L1 distance between image gradients -- penalises blur and edge softness.
+
+    L1/PSNR training tends to soft, structurally-weak output (high PSNR, low
+    SSIM). Matching finite-difference gradients pushes the model to reproduce
+    edges and high-frequency detail, which is where a hand-tuned sharpener (FSR's
+    RCAS) otherwise wins. Inputs (H,W,3).
+    """
+    dx_p = pred[:, 1:] - pred[:, :-1]
+    dx_t = target[:, 1:] - target[:, :-1]
+    dy_p = pred[1:, :] - pred[:-1, :]
+    dy_t = target[1:, :] - target[:-1, :]
+    return F.l1_loss(dx_p, dx_t) + F.l1_loss(dy_p, dy_t)
 
 
 def temporal_instability(
