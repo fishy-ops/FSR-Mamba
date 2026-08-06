@@ -17,6 +17,9 @@ __pycache__/
 prototype/out/
 *.pt
 
+# Generated video frames and comparison images
+prototype/_vidframes*/
+
 # OS
 .DS_Store
 Thumbs.db

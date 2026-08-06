@@ -22,6 +22,7 @@ and would not frame them.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -65,6 +66,8 @@ PASS_TIMEOUT = 300  # seconds to wait for one pass before giving up
 # at 1440p a large scene exhausts the 2070 Super's 8 GB VRAM and crashes. 1080p
 # is ~44% fewer pixels and fits.
 RES_W, RES_H = 1920, 1080
+GT_RES = None
+_RESTORE_FULLSCREEN = []
 
 
 def write_config(base_cfg: dict, gltf: str, camera: str) -> None:
@@ -84,7 +87,7 @@ def _kill_stale() -> None:
     time.sleep(4)  # let the GPU actually release the killed process's memory
 
 
-def run_pass(mode: str, out_dir: str) -> int:
+def run_pass(mode: str, out_dir: str, res=None) -> int:
     """Launch one capture pass, wait for completion, return frame count."""
     _kill_stale()
     os.makedirs(out_dir, exist_ok=True)
@@ -105,7 +108,8 @@ def run_pass(mode: str, out_dir: str) -> int:
     })
     # Launch by absolute path with cwd=bin (so relative media/config paths
     # resolve). subprocess runs the exe directly, avoiding cmd's cwd-search quirk.
-    proc = subprocess.Popen([EXE, "-resolution", str(RES_W), str(RES_H)],
+    rw, rh = res if res else (RES_W, RES_H)
+    proc = subprocess.Popen([EXE, "-resolution", str(rw), str(rh)],
                             cwd=BIN, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + WARMUP_SEC + PASS_TIMEOUT
@@ -139,9 +143,50 @@ def _log_says_complete() -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    global COUNT, ORBIT, RES_W, RES_H, GT_RES
     ap.add_argument("--out", default="D:/FSR-Mamba/captures")
     ap.add_argument("--scenes", nargs="*", help="subset of scene names (default: all)")
+    ap.add_argument("--orbit", type=float, default=ORBIT,
+                    help="camera yaw radians/frame. Varying this is how we get multiple "
+                         "camera paths per scene -- different motion magnitude exercises "
+                         "the velocity-dependent behaviour and changes disocclusion rate, "
+                         "which is the diversity axis that matters for a temporal upscaler.")
+    ap.add_argument("--suffix", type=str, default="",
+                    help="appended to the output scene name, so several paths through the "
+                         "same scene land in separate directories.")
+    ap.add_argument("--res", type=str, default="",
+                    help="render resolution as WxH, e.g. 2560x1440. Default 1920x1080. "
+                         "Higher is worth trying because the GT pass is a 1-SAMPLE-PER-PIXEL "
+                         "native render, i.e. an aliased supervision target -- production "
+                         "upscalers train against supersampled references. Capturing GT at "
+                         "1440p and downsampling to 1080p yields ~1.78 samples/pixel. The "
+                         "risk is VRAM: the native pass renders the full frame with no "
+                         "upscaling and 1440p was previously observed to exhaust 8 GB on "
+                         "large scenes.")
+    ap.add_argument("--fullscreen", action="store_true",
+                    help="run the sample fullscreen so the requested render height is not clamped by the window client area. Required for an exact 2560x1440 GT pass.")
+    ap.add_argument("--gt-res", type=str, default="",
+                    help="render the NATIVE/GT pass at this WxH instead of --res. Set it to an exact integer multiple of --res (same aspect ratio) and the GT can be downsampled to the FSR pass size to give a genuinely supersampled, anti-aliased target. The default 1-sample-per-pixel GT is itself aliased, which caps what any model trained on it can learn. Aspect MUST match or the two passes frame the scene differently and the pairs are silently misaligned.")
+    ap.add_argument("--count", type=int, default=COUNT,
+                    help="frames to capture per pass (default 24). Longer sequences give "
+                         "deeper temporal accumulation and longer comparison clips, but cost "
+                         "~92 MB/frame across both passes -- watch disk.")
     args = ap.parse_args()
+    COUNT = args.count
+    ORBIT = args.orbit
+    if args.res:
+        RES_W, RES_H = (int(v) for v in args.res.lower().split("x"))
+        print(f"render resolution overridden -> {RES_W}x{RES_H}")
+    if args.gt_res:
+        GT_RES = tuple(int(v) for v in args.gt_res.lower().split("x"))
+        ar_f, ar_g = RES_W / RES_H, GT_RES[0] / GT_RES[1]
+        if abs(ar_f - ar_g) > 1e-3:
+            raise SystemExit(f"aspect mismatch: fsr pass {ar_f:.4f} vs gt pass "
+                             f"{ar_g:.4f}. The passes would frame the scene "
+                             f"differently and every pair would be misaligned.")
+        print(f"GT pass renders at {GT_RES[0]}x{GT_RES[1]} "
+              f"({GT_RES[0]/RES_W:.2f}x linear = {(GT_RES[0]/RES_W)**2:.1f}x samples/pixel)")
+    print(f"capturing {COUNT} frames per pass")
 
     names = {s[0] for s in SCENES}
     todo = SCENES if not args.scenes else [s for s in SCENES if s[0] in set(args.scenes)]
@@ -154,6 +199,27 @@ def main() -> None:
     with open(CAULDRON_CONFIG) as f:
         ccfg = json.load(f)
     root = next(iter(ccfg.values()))
+    if args.fullscreen:
+        # Windowed mode silently clamps the render height to the client area -- a
+        # requested 2560x1440 comes back as 2560x1421, which changes the ASPECT RATIO
+        # (1.8015 vs 1.7778) and therefore the framing. Two passes at different aspects
+        # frame the scene differently, so their frames do not correspond and every
+        # training pair built from them is misaligned. Measured: a 1440p GT downsampled
+        # to 1080p scores only 24.6 dB against the 1080p GT of the same frame.
+        # Fullscreen removes the clamp, so 1920x1080 and 2560x1440 share an exact 1.7778
+        # aspect and the GT pass can be a true supersample of the FSR pass.
+        pres = root.setdefault("Presentation", {})
+        pres["Fullscreen"] = True
+        # cauldronconfig.json is PERSISTENT and the restore path below only ever
+        # covered the scene config, so a single --fullscreen run silently left the
+        # sample in fullscreen for every later capture -- which forces both passes to
+        # the display resolution and defeats --gt-res without any visible error. Ten
+        # minutes of captures were produced at ratio 1.0 that way. Registered for
+        # restore in the finally block.
+        _RESTORE_FULLSCREEN.append(True)
+        with open(CAULDRON_CONFIG, "w") as f:
+            json.dump(ccfg, f, indent=4)
+        print("fullscreen enabled (removes the windowed height clamp)")
     alloc = root.setdefault("Allocations", {})
     if alloc.get("DynamicBufferPoolSize", 0) < DYNAMIC_BUFFER_POOL:
         alloc["DynamicBufferPoolSize"] = DYNAMIC_BUFFER_POOL
@@ -173,8 +239,20 @@ def main() -> None:
         for i, (name, gltf, cam) in enumerate(todo, 1):
             print(f"[{i}/{len(todo)}] {name}  ({cam})")
             write_config(base_cfg, gltf, cam)
-            nf = run_pass("fsr", os.path.join(args.out, name, "fsr"))
-            ng = run_pass("native", os.path.join(args.out, name, "gt"))
+            # --suffix lands several camera paths through one scene in separate
+            # directories (e.g. hangar, hangar_slow, hangar_fast).
+            out_name = name + args.suffix
+            # A decoded cache sits BESIDE fsr/ and gt/, and load_engine_scene prefers
+            # it over the raw frames. run_pass only clears the pass directories, so a
+            # cache left from an earlier capture of this scene silently wins -- a
+            # 6-frame test cache made a freshly captured 48-frame scene load as 6.
+            # Drop it here so the next load re-decodes what was actually captured.
+            for _stale in glob.glob(os.path.join(args.out, out_name, "_cache_*.pt")):
+                os.remove(_stale)
+                print(f"      removed stale cache {os.path.basename(_stale)}")
+            nf = run_pass("fsr", os.path.join(args.out, out_name, "fsr"))
+            ng = run_pass("native", os.path.join(args.out, out_name, "gt"),
+                          res=GT_RES)
             ok = nf >= COUNT and ng >= COUNT
             print(f"      fsr={nf} gt={ng}  {'OK' if ok else 'INCOMPLETE'}")
             results.append((name, nf, ng, ok))

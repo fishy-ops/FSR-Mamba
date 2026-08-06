@@ -1,4 +1,17 @@
-# Handoff — start here
+# Handoff — SUPERSEDED, see D:/FSR-Mamba/RESUME_HERE.md
+
+> **This file is stale (written 2026-07-18) and predates all engine capture.**
+> Its headline result (+1.4 dB on synthetic scenes) was measured on the analytic
+> testbed, before any real engine data existed, and the numbers in it are not
+> comparable to anything current. Several of its open items are now closed.
+>
+> **Start at `D:/FSR-Mamba/RESUME_HERE.md`**, with run-by-run detail in
+> `D:/FSR-Mamba/SCOREBOARD.md`.
+>
+> Kept only for the project background in the sections below, which is still
+> accurate: what the fork is, the novelty framing, the FSR version map, and the
+> three FSR implementation traps (the 4-channel state at `accumulate.h:165`, the
+> sliced Lanczos weight in `common.h:47`, and holding out scenes rather than frames).
 
 Written 2026-07-18 at the end of the macOS session, for whoever (or whatever)
 picks this up on the Windows machine. The prior chat does not transfer; this

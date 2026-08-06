@@ -85,6 +85,62 @@ def gradient_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(dx_p, dx_t) + F.l1_loss(dy_p, dy_t)
 
 
+_VGG = None
+
+
+def perceptual_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """VGG16 feature-space L1 -- the standard cure for L1/PSNR blur.
+
+    Pixel losses (L1, even + gradient/freq) are minimised by the conditional mean,
+    which is smooth: that is the whole reason for our SSIM ceiling. A perceptual
+    loss compares deep features instead of pixels, so producing *plausibly
+    structured* detail (matching the target's textures/edges in feature space) is
+    rewarded even when it is not pixel-exact -- pushing the net off the smooth mean.
+    Features taken at relu1_2 / relu2_2 / relu3_3. Inputs (H,W,3) in ~[0,1] RGB.
+    """
+    global _VGG
+    if _VGG is None:
+        from torchvision.models import VGG16_Weights, vgg16
+        v = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:16].eval().to(pred.device)
+        for p in v.parameters():
+            p.requires_grad_(False)
+        _VGG = v
+    mean = torch.tensor([0.485, 0.456, 0.406], device=pred.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=pred.device).view(1, 3, 1, 1)
+
+    def prep(x):
+        x = x.permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        return (x - mean) / std
+
+    xp, xt = prep(pred), prep(target)
+    taps = {3, 8, 15}
+    loss = pred.new_zeros(())
+    for i, layer in enumerate(_VGG):
+        xp = layer(xp)
+        xt = layer(xt)
+        if i in taps:
+            loss = loss + F.l1_loss(xp, xt)
+    return loss
+
+
+def freq_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L1 on the log-magnitude 2-D FFT spectrum -- a direct blur penalty.
+
+    L1/gradient losses are local; a smoothed output can still track them while
+    missing the mid/high-frequency *energy* that carries perceived detail (the
+    exact failure behind our SSIM ceiling: the accumulator regresses to a smooth
+    conditional mean). Matching |FFT| forces the output to carry the same
+    frequency content as the target, so missing high-freq is penalised globally
+    regardless of where the loss of detail happened. log1p compresses the huge
+    DC/low-freq terms so the gradient isn't dominated by them. Inputs (H,W,3).
+    """
+    p = pred.permute(2, 0, 1)
+    t = target.permute(2, 0, 1)
+    fp = torch.log1p(torch.abs(torch.fft.rfft2(p, norm="ortho")))
+    ft = torch.log1p(torch.abs(torch.fft.rfft2(t, norm="ortho")))
+    return F.l1_loss(fp, ft)
+
+
 def temporal_instability(
     curr: torch.Tensor, prev: torch.Tensor, mv: torch.Tensor
 ) -> float:
@@ -117,3 +173,32 @@ def temporal_instability(
 
     diff = (curr - warped).abs().mean(dim=-1)
     return diff[valid].mean().item()
+
+
+def edge_gradient_l1(pred: torch.Tensor, target: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+    """Gradient L1 **weighted by ground-truth edge strength**. Inputs (H,W,3).
+
+    `gradient_l1` spreads its penalty over the whole frame, so flat regions -- which are
+    the majority of pixels and already correct -- dominate the term. Direct measurement
+    says the deficit is not global softness but *edges specifically*: on GT edge pixels
+    our edge contrast is 0.55-0.69 of ground truth while FSR reaches 0.82, and the same
+    models match or beat FSR on textured non-edge regions. Weighting the gradient penalty
+    by |grad(GT)| concentrates it exactly where the measured gap is, instead of asking the
+    network to sharpen areas that are already right.
+
+    The weight uses the *target's* gradient, not the prediction's, so the model cannot
+    reduce the loss by simply flattening its own output.
+    """
+    dx_p = pred[:, 1:] - pred[:, :-1]
+    dx_t = target[:, 1:] - target[:, :-1]
+    dy_p = pred[1:, :] - pred[:-1, :]
+    dy_t = target[1:, :] - target[:-1, :]
+
+    wx = dx_t.abs().mean(dim=-1, keepdim=True).detach()
+    wy = dy_t.abs().mean(dim=-1, keepdim=True).detach()
+    if power != 1.0:
+        wx, wy = wx.pow(power), wy.pow(power)
+    # Normalise so the term's scale does not depend on how edgy the crop happens to be.
+    wx = wx / (wx.mean() + 1e-6)
+    wy = wy / (wy.mean() + 1e-6)
+    return ((dx_p - dx_t).abs() * wx).mean() + ((dy_p - dy_t).abs() * wy).mean()
