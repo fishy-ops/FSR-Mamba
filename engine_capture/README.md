@@ -28,7 +28,7 @@ synthetic `render_sequence` frames.
 ```bash
 cd fsr-upstream
 git apply ../engine_capture/fsrapi_capture.patch
-# then rebuild the FSR sample (see ../HANDOFF or the build_*.cmd scripts on D:)
+# then rebuild the FSR sample
 ```
 
 ## Running a capture

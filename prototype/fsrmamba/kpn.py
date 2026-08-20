@@ -34,8 +34,7 @@ inside the convex hull of its candidate samples, so:
   without ever being able to invent an out-of-range colour. Expressiveness and
   stability stop being in tension, which is the trade every previous run fought.
 
-It is also a strict generalisation of FSR, which is the design rule that made this
-project work in the first place (see the architecture lesson in HANDOFF.md). FSR's
+It is also a strict generalisation of FSR. FSR's
 resolve is itself a weighted sum: a sliced Lanczos over the low-res taps at
 ~0.046 weight per frame against history at up to 1.0. If this head puts 0.954 on
 the history candidate and spreads 0.046 over the tap candidates in Lanczos ratios,

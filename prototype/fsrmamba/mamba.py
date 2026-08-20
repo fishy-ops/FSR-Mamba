@@ -411,10 +411,7 @@ class MambaAccumulator(nn.Module):
         """Move the state along the motion vectors.
 
         Same operation as the baseline's history reprojection, applied to N
-        learned channels instead of RGB+lock. This is the step that degrades
-        state a little every frame, and the open question flagged in
-        ORIENTATION.md -- whether interpolating between two learned state
-        vectors yields a meaningful state vector -- lives right here.
+        learned channels instead of RGB+lock.
         """
         uv = self._resolve._hr_uv + mv_hr
         grid = (uv * 2.0 - 1.0).unsqueeze(0)
@@ -651,8 +648,7 @@ class MambaAccumulator(nn.Module):
             # Dense combination: every expert is evaluated and mixed by weight.
             # This measures the *quality* ceiling of routing. A shippable
             # version would route whole tiles to avoid paying for every expert
-            # on every wave -- see ORIENTATION.md on wave divergence. Quality
-            # first, sparsity second.
+            # on every wave. Quality first, sparsity second.
             stacked = torch.cat([torch.sigmoid(hd(alpha_in)) for hd in self.alpha_heads], dim=1)
             alpha = (stacked * weights).sum(dim=1, keepdim=True)
 

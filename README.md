@@ -229,8 +229,6 @@ python train.py \
 
 ```
 README.md                     This file
-ORIENTATION.md                Findings on the FSR source code
-HANDOFF.md                    Cross-machine context
 prototype/
   train.py                    Training script with all flags
   fsrmamba/
