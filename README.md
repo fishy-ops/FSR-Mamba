@@ -24,7 +24,14 @@ indistinguishable. Temporal stability is the one remaining metric to close.
 
 The model keeps FSR's overall pipeline shape — Lanczos resolve, motion-vector
 reprojection, history rectification, alpha blending — but replaces the
-hand-tuned accumulation rules with learned components:
+hand-tuned accumulation rules with learned components.
+
+**Yes, the selective state-space model (SSM) is still the core temporal mechanism
+in the final v64 checkpoint.** The SSM was never replaced — later additions
+(kernel prediction head, LR upsampler) work *alongside* it, not instead of it.
+The SSM's per-pixel state `h` carries temporal memory across frames; its output
+`y` feeds into both the alpha blend and the KPN head as their primary feature
+signal.
 
 ```
 LR input (540p) ─────────────────────────────┐
@@ -33,33 +40,47 @@ LR input (540p) ─────────────────────�
   │                                           │
   ├── Flat encoder (2×conv3×3)                │
   │     └── SSM projections (Δ, B, C, X)      │
-  │           └── Selective state update       │
-  │                 └── Learned alpha blend    │
-  │                       └── History rectification (learned box scale)
-  │                             └── Kernel prediction head (KPN)
-  │                                   ├── LR taps at output res
-  │                                   ├── Rectified history
-  │                                   └── Current resolve
-  │                                         ↓
+  │           └── Selective state update ──────┤  ← temporal backbone
+  │                 │                          │    (h carries memory
+  │                 │                          │     across frames)
+  │                 ├── Learned alpha blend    │
+  │                 │     └── History rectification (learned box scale)
+  │                 │
+  │                 └── Kernel prediction head (KPN)
+  │                       ├── LR taps at output res
+  │                       ├── Rectified history
+  │                       └── Current resolve
+  │                             ↓
   └── LR Upsampler (4×ResBlock + PixelShuffle)── high-freq residual
                                                     ↓
                                               Output (1080p)
 ```
 
-### Key components
+### How the SSM and KPN work together
 
-- **Selective SSM**: Per-pixel learned gates control how much to trust history
-  vs the current frame — the direct analogue of FSR's `ComputeBaseAccumulationWeight`,
-  but learned instead of hand-tuned.
+The **SSM** handles the *temporal* question: for each pixel, how much to trust
+the accumulated history vs the current frame. It maintains a hidden state `h`
+that is warped along motion vectors each frame and updated via input-dependent
+gates (the selective scan from Mamba):
+
+```
+delta = softplus(to_delta(enc))       # per-pixel forget rate
+a_bar = exp(-delta)                   # decay gate
+h = a_bar * h_prev + (1-a_bar) * B(enc) * X(enc)   # state update
+y = C(enc) * h                        # readout
+```
+
+The **KPN** handles the *spatial* question: given the SSM's temporal readout
+`y` and the encoder features, predict per-pixel softmax weights over 11 real
+candidate colours (9 LR taps + warped history + Lanczos resolve). The output
+is a convex combination — bounded by definition, so it cannot diverge through
+the recurrence. This solved the stability collapse that killed v15–v17.
+
+### Other key components
 
 - **History rectification**: FSR's anisotropic YCoCg colour box clamp, but with a
   *learned* per-pixel box scale in [1, box_max] instead of FSR's velocity-based
   heuristic. Prevents stale smooth history from overriding sharp current-frame detail.
-
-- **Kernel prediction head (KPN)**: Predicts per-pixel softmax weights over real
-  candidate colours (LR taps, warped history, Lanczos resolve) instead of predicting
-  colour directly. Output is a convex combination — cannot diverge through the
-  recurrence. This solved the stability collapse that killed v15–v17.
 
 - **LR Upsampler**: 4-layer ResNet at render resolution with PixelShuffle 2×
   expansion. Recovers high-frequency detail the fixed Lanczos 3×3 taps discard.
