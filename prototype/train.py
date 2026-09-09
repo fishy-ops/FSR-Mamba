@@ -35,6 +35,7 @@ from fsrmamba.mamba import MambaAccumulator, MambaState
 from fsrmamba.metrics import (
     edge_gradient_l1, freq_l1, gradient_l1, perceptual_l1, psnr, ssim, ssim_map_mean,
     temporal_instability,
+    temporal_deviation,
 )
 from fsrmamba.synth import halton_jitter, random_scene
 from fsrmamba.engine_data import crop_sequence, list_scenes, load_engine_scene
@@ -86,8 +87,8 @@ def evaluate(model, frames, out_size, state_channels):
         if is_learned
         else FSRState.zeros(out_size)
     )
-    prev_out, prev_depth = None, None
-    tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+    prev_out, prev_depth, prev_gt = None, None, None
+    tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0, "dev": 0.0}
     n_ti = 0
     with torch.no_grad():
         for f in frames:
@@ -99,30 +100,36 @@ def evaluate(model, frames, out_size, state_channels):
             tot["ssim"] += ssim(out, f["gt"])
             if prev_out is not None:
                 tot["ti"] += temporal_instability(out, prev_out, f["mv"])
+                dev, _ = temporal_deviation(out, prev_out, f["gt"], prev_gt, f["mv"])
+                tot["dev"] += abs(dev)
                 n_ti += 1
-            prev_out = out
+            prev_out, prev_gt = out, f["gt"]
     n = len(frames)
-    return tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)
+    return (tot["psnr"] / n, tot["ssim"] / n,
+            tot["ti"] / max(1, n_ti), tot["dev"] / max(1, n_ti))
 
 
-def evaluate_captured(frames) -> tuple[float, float, float]:
+def evaluate_captured(frames) -> tuple[float, float, float, float]:
     """Baseline metrics from the *captured* FSR output vs ground truth.
 
     In engine mode the baseline is the real FSR 3.1.4 output we captured, not the
     ported accumulator -- so this just scores frames["fsr_out"] against the GT.
     """
-    tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+    tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0, "dev": 0.0}
     n_ti = 0
-    prev = None
+    prev = prev_gt = None
     for f in frames:
         tot["psnr"] += psnr(f["fsr_out"], f["gt"])
         tot["ssim"] += ssim(f["fsr_out"], f["gt"])
-        if prev is not None:
+        if prev is not None and prev_gt is not None:
             tot["ti"] += temporal_instability(f["fsr_out"], prev, f["mv"])
+            dev, _ = temporal_deviation(f["fsr_out"], prev, f["gt"], prev_gt, f["mv"])
+            tot["dev"] += abs(dev)
             n_ti += 1
-        prev = f["fsr_out"]
+        prev, prev_gt = f["fsr_out"], f["gt"]
     n = len(frames)
-    return tot["psnr"] / n, tot["ssim"] / n, tot["ti"] / max(1, n_ti)
+    return (tot["psnr"] / n, tot["ssim"] / n,
+            tot["ti"] / max(1, n_ti), tot["dev"] / max(1, n_ti))
 
 
 def train_engine(args) -> None:
@@ -207,8 +214,8 @@ def train_engine(args) -> None:
         """Score one crop sequence. run_model=None -> captured FSR baseline."""
         frames = to_dev(frames_cpu)
         state = MambaState.zeros(out_size, args.state_channels, device=dev) if run_model else None
-        prev_out, prev_depth = None, None
-        tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+        prev_out, prev_depth, prev_gt = None, None, None
+        tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0, "dev": 0.0}
         n_ti = 0
         for f in frames:
             if run_model is not None:
@@ -281,8 +288,8 @@ def train_engine(args) -> None:
         def score_full(scene, use_model):
             uh, uw, _ = scene[0]["gt"].shape
             state = MambaState.zeros(fo, args.state_channels, device=dev) if use_model else None
-            prev_out, prev_depth = None, None
-            tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0}
+            prev_out, prev_depth, prev_gt = None, None, None
+            tot = {"psnr": 0.0, "ssim": 0.0, "ti": 0.0, "dev": 0.0}
             n_ti = 0
             for raw in scene:
                 # Built and moved one frame at a time; see _full_frame.
@@ -791,8 +798,9 @@ def main() -> None:
 
     # --- baseline reference ---
     base = FSRAccumulator(render_size, out_size, device=dev)
-    b_psnr, b_ssim, b_ti = eval_all(base)
-    print(f"\nFSR baseline   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
+    b_psnr, b_ssim, b_ti, b_dev = eval_all(base)
+    print(f"\nFSR baseline   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  "
+          f"temporal {b_ti:.5f}  |dev| {b_dev:.5f}")
 
     # --- train ---
     model = MambaAccumulator(
@@ -848,19 +856,24 @@ def main() -> None:
 
         if epoch % 2 == 0 or epoch == args.epochs - 1:
             model.eval()
-            p, s, ti = eval_all(model)
+            p, s, ti, dv = eval_all(model)
             flag = ""
             if p > b_psnr and ti < b_ti:
                 flag = "  <-- beats baseline on both"
             print(
                 f"epoch {epoch:3d}  loss {epoch_loss:7.4f}   "
-                f"PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}{flag}"
+                f"PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}  |dev| {dv:.5f}{flag}"
             )
 
     print("\n--- final ---")
-    print(f"FSR baseline   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  temporal {b_ti:.5f}")
-    p, s, ti = eval_all(model)
-    print(f"learned        PSNR {p:6.2f}  SSIM {s:.4f}  temporal {ti:.5f}")
+    print(f"FSR baseline   PSNR {b_psnr:6.2f}  SSIM {b_ssim:.4f}  "
+          f"temporal {b_ti:.5f}  |dev| {b_dev:.5f}")
+    p, s, ti, dv = eval_all(model)
+    print(f"learned        PSNR {p:6.2f}  SSIM {s:.4f}  "
+          f"temporal {ti:.5f}  |dev| {dv:.5f}")
+    print("\n|dev| is distance from the ground truth's OWN temporal instability;\n"
+          "0 is the target. Raw 'temporal' alone is minimised by a blurrier\n"
+          "output, so it cannot be selected on -- see metrics.temporal_deviation.")
 
     if args.save:
         torch.save(model.state_dict(), args.save)

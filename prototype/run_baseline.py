@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from fsrmamba.baseline import FSRAccumulator, FSRState
-from fsrmamba.metrics import psnr, ssim, temporal_instability
+from fsrmamba.metrics import psnr, ssim, temporal_instability, temporal_deviation
 from fsrmamba.synth import default_scene, halton_jitter
 
 
@@ -48,8 +48,9 @@ def main() -> None:
     acc = FSRAccumulator(render_size, out_size)
     state = FSRState.zeros(out_size)
 
-    totals = {k: {"psnr": 0.0, "ssim": 0.0, "ti": 0.0} for k in ("bilinear", "lanczos", "fsr")}
+    totals = {k: {"psnr": 0.0, "ssim": 0.0, "ti": 0.0, "dev": 0.0} for k in ("bilinear", "lanczos", "fsr")}
     prev = {k: None for k in totals}
+    prev_gt = None
     prev_depth = None
     n_ti = 0
 
@@ -89,7 +90,13 @@ def main() -> None:
             totals[name]["ssim"] += ssim(img, gt.color)
             if prev[name] is not None:
                 totals[name]["ti"] += temporal_instability(img, prev[name], hr_aux.mv)
+                if prev_gt is not None:
+                    dev, _ = temporal_deviation(
+                        img, prev[name], gt.color, prev_gt, hr_aux.mv
+                    )
+                    totals[name]["dev"] += abs(dev)
             prev[name] = img.detach()
+        prev_gt = gt.color.detach()
         if i > 0:
             n_ti += 1
 
@@ -109,14 +116,19 @@ def main() -> None:
             print(f"wrote {dump_dir/'comparison.png'} (bilinear / lanczos / fsr / gt)")
 
     print()
-    print(f"{'method':<10} {'PSNR (dB)':>10} {'SSIM':>8} {'temporal instab.':>18}")
+    print(f"{'method':<10} {'PSNR (dB)':>10} {'SSIM':>8} "
+          f"{'temporal instab.':>18} {'|dev|':>10}")
     print("-" * 50)
     for name, t in totals.items():
         print(
             f"{name:<10} {t['psnr']/args.frames:>10.2f} {t['ssim']/args.frames:>8.4f}"
             f" {t['ti']/max(1,n_ti):>18.5f}"
+            f" {t.get('dev', 0.0)/max(1,n_ti):>10.5f}"
         )
-    print("\n(temporal instability: lower is better)")
+    print("\n(temporal: raw motion-compensated instability. Lower is NOT")
+    print(" automatically better -- a blurrier output scores lower.")
+    print(" |dev|: distance from the ground truth's own instability;")
+    print(" 0 is the target. Select on |dev|.)")
 
 
 if __name__ == "__main__":

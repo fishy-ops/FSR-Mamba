@@ -8,7 +8,8 @@ Three numbers matter for this project, and they are not interchangeable:
   still a single-frame measure.
 * **Temporal instability** -- how much the output flickers between frames once
   motion is compensated for. This is the metric upscalers actually live or die
-  on, and it is the one a single-frame model cannot optimise for. Lower is
+  on, and it is the one a single-frame model cannot optimise for. Lower is NOT
+  automatically better -- see temporal_deviation; raw
   better.
 
 The temporal metric is the interesting one here: a learned accumulator that
@@ -21,7 +22,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-__all__ = ["psnr", "ssim", "ssim_map_mean", "gradient_l1", "temporal_instability"]
+__all__ = ["psnr", "ssim", "ssim_map_mean", "gradient_l1", "temporal_instability",
+           "temporal_deviation"]
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
@@ -173,6 +175,41 @@ def temporal_instability(
 
     diff = (curr - warped).abs().mean(dim=-1)
     return diff[valid].mean().item()
+
+
+def temporal_deviation(
+    curr: torch.Tensor,
+    prev: torch.Tensor,
+    gt_curr: torch.Tensor,
+    gt_prev: torch.Tensor,
+    mv: torch.Tensor,
+) -> tuple[float, float]:
+    """How far the output's temporal behaviour sits from the ground truth's.
+
+    Returns ``(deviation, gt_instability)`` where
+    ``deviation = instability(output) - instability(ground truth)``.
+
+    `temporal_instability` never references the ground truth, so it is minimised
+    by an output that does not change: a blurred or ghosted result scores BETTER
+    than a correct one. Measured on a synthetic moving sequence, a heavily
+    blurred output scores 0.02623 against a perfect reconstruction's 0.10806 --
+    4x "better" at 21 dB. Motion compensation does protect against a frozen
+    frame; it does not protect against blur, which is exactly what an over-eager
+    accumulator produces.
+
+    Zero is the target and the SIGN is a diagnosis:
+
+    * **negative** -- more stable than reality: over-smoothing, ghosting, or an
+      accumulator that has begun ignoring new samples.
+    * **positive** -- flickers more than the truth: shimmer, unstable accumulation.
+
+    Select on ``abs(deviation)``. This is the same principle `edge_gradient_l1`
+    already applies spatially -- reference the target, so the model cannot win by
+    flattening its own output.
+    """
+    out_ti = temporal_instability(curr, prev, mv)
+    gt_ti = temporal_instability(gt_curr, gt_prev, mv)
+    return out_ti - gt_ti, gt_ti
 
 
 def edge_gradient_l1(pred: torch.Tensor, target: torch.Tensor, power: float = 1.0) -> torch.Tensor:
