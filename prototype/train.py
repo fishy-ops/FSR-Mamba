@@ -36,6 +36,7 @@ from fsrmamba.metrics import (
     edge_gradient_l1, freq_l1, gradient_l1, perceptual_l1, psnr, ssim, ssim_map_mean,
     temporal_instability,
     temporal_deviation,
+    fdl,
 )
 from fsrmamba.synth import halton_jitter, random_scene
 from fsrmamba.engine_data import crop_sequence, list_scenes, load_engine_scene
@@ -481,6 +482,8 @@ def train_engine(args) -> None:
                         loss = loss + args.distill_weight * F.l1_loss(out, t_out)
                     if args.freq_weight > 0:
                         loss = loss + args.freq_weight * freq_l1(out, f["gt"])
+                    if args.fdl_weight > 0:
+                        loss = loss + args.fdl_weight * fdl(out, f["gt"])
                     if args.perceptual_weight > 0:
                         loss = loss + args.perceptual_weight * perceptual_l1(out, f["gt"])
                     if prev_out is not None:
@@ -723,6 +726,14 @@ def main() -> None:
     ap.add_argument("--grad-weight", type=float, default=0.0, help="weight on gradient-L1 (sharpness) loss")
     ap.add_argument("--freq-weight", type=float, default=0.0,
                     help="weight on log-magnitude FFT L1 loss (global blur penalty)")
+    # Frequency Distribution Loss. Off by default: it costs ~5x a plain step, so
+    # it belongs in a fine-tune, not a from-scratch run. In webvsr it was the
+    # only one of nine imported techniques that measured better rather than
+    # worse, and its gain was specifically on RENDERED content -- which is all
+    # this project has. Suggested starting weight 0.75.
+    ap.add_argument("--fdl-weight", type=float, default=0.0,
+                    help="weight on Frequency Distribution Loss (sliced Wasserstein "
+                         "on VGG feature FFTs; misalignment-robust, anti-blur)")
     ap.add_argument("--perceptual-weight", type=float, default=0.0,
                     help="weight on VGG16 feature-space L1 (perceptual, breaks L1 mean-blur)")
     ap.add_argument("--edge-bias", type=float, default=0.0,

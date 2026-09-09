@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 __all__ = ["psnr", "ssim", "ssim_map_mean", "gradient_l1", "temporal_instability",
-           "temporal_deviation"]
+           "temporal_deviation", "fdl"]
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
@@ -141,6 +141,80 @@ def freq_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     fp = torch.log1p(torch.abs(torch.fft.rfft2(p, norm="ortho")))
     ft = torch.log1p(torch.abs(torch.fft.rfft2(t, norm="ortho")))
     return F.l1_loss(fp, ft)
+
+
+_FDL = None
+
+
+def fdl(pred: torch.Tensor, target: torch.Tensor, phase_weight: float = 1.0) -> torch.Tensor:
+    """Frequency Distribution Loss (Ni et al., arXiv:2402.18192).
+
+    `perceptual_l1` compares deep features *position by position*, so a texture
+    reproduced correctly but shifted a pixel scores as an error -- and the
+    cheapest way to satisfy that is to blur, which is the failure we are already
+    fighting. `freq_l1` matches global spectrum magnitude but discards all
+    spatial structure.
+
+    FDL sits between them: it takes the FFT of VGG features, then compares
+    magnitude and phase as *distributions* -- random 4x4 projections, sorted
+    independently, L1 between the sorted vectors (a sliced 1-D Wasserstein
+    distance). Sorting throws away position, so it asks for the right statistics
+    without demanding they land in the right place.
+
+    Ported from the webvsr project, where it was the only one of nine imported
+    techniques that measured better rather than worse -- and its win was
+    specifically on RENDERED content: DISTS margin over bicubic went +14.8% ->
+    +23.8% on the render clips while being a wash on camera footage. It also
+    improved temporal deviation ~25x there. This project is entirely rendered
+    content, which is why it is worth trying here.
+
+    Measured property that motivates it: on a blur-vs-1px-shift test, FDL's
+    blur/shift penalty ratio is 3.02 (it punishes blur 3x harder than
+    misalignment), where MS-SSIM's is 0.19 -- i.e. MS-SSIM punishes a one-pixel
+    shift *five times harder* than real blur.
+
+    Inputs (H, W, 3) in ~[0,1]. Costs roughly 5x a plain step -- use it as a
+    fine-tune term, not from scratch.
+    """
+    global _FDL
+    if _FDL is None:
+        from torchvision.models import VGG19_Weights, vgg19
+        feats = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
+        for q in feats.parameters():
+            q.requires_grad_(False)
+        stages = [(0, 4), (4, 9), (9, 18), (18, 27), (27, 36)]
+        chns = (64, 128, 256, 512, 512)
+        g = torch.Generator().manual_seed(0)          # fixed: the loss must not
+        projs = []                                    # change between runs
+        for c in chns:
+            r = torch.randn(24, c, 4, 4, generator=g)
+            projs.append((r / r.flatten(1).norm(dim=1).view(-1, 1, 1, 1)).to(pred.device))
+        _FDL = ([torch.nn.Sequential(*[feats[i] for i in range(a, b)]).eval().to(pred.device)
+                 for a, b in stages], projs, (0.5, 0.5, 1.0, 1.0, 1.0))
+
+    stages, projs, w = _FDL
+    mean = torch.tensor([0.485, 0.456, 0.406], device=pred.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=pred.device).view(1, 3, 1, 1)
+
+    def prep(x):
+        return (x.permute(2, 0, 1).unsqueeze(0).clamp(0, 1) - mean) / std
+
+    def sliced_w1(a, b, proj):
+        pa = F.conv2d(a, proj).flatten(2)
+        pb = F.conv2d(b, proj).flatten(2)
+        return (pa.sort(dim=-1).values - pb.sort(dim=-1).values).abs().mean()
+
+    x, y = prep(pred), prep(target)
+    score = pred.new_zeros(())
+    for st, proj, wi in zip(stages, projs, w):
+        x = st(x)
+        with torch.no_grad():
+            y = st(y)
+        fx, fy = torch.fft.fftn(x, dim=(-2, -1)), torch.fft.fftn(y, dim=(-2, -1))
+        s_ = sliced_w1(fx.abs(), fy.abs(), proj)
+        s_ = s_ + phase_weight * sliced_w1(torch.angle(fx), torch.angle(fy), proj)
+        score = score + wi * s_
+    return score * 0.01           # the reference's scale for non-DINO backbones
 
 
 def temporal_instability(
