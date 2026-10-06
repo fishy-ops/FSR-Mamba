@@ -84,7 +84,7 @@ state and beats this prototype and FSR on PSNR, SSIM and temporal deviation.
 Eleven weeks and more than 70 trained models, in four stages. The commit history up to September covers
 the first two; October's work is squashed into the last commit.
 
-### 1. A learned accumulator (July)
+### 1. A learned accumulator 
 
 The baseline was a Python port of FSR 3.1.4's accumulation pass, checked against AMD's HLSL. On top
 of it went a selective state-space (Mamba) accumulator whose per-pixel state is warped along motion
@@ -92,7 +92,7 @@ vectors. Trained on procedurally generated motion with known ground truth, it wa
 temporally stable than the ported baseline (instability 0.0063, PSNR 20.44, SSIM 0.831). That showed
 the idea worked, but synthetic data could not say anything about real rendering.
 
-### 2. Real engine data and the search for quality (July to September)
+### 2. Real engine data and the search for quality 
 
 A UE5 capture harness dumps colour, motion vectors, depth and a 4x SSAA ground truth for ten scenes
 (seven train, three validation). Training on real captures changed what mattered: real disocclusion
@@ -109,7 +109,7 @@ Dead ends from this stage: expert routing, Swin-transformer refiners, separable 
 widths, and RCAS sharpening (it lowered PSNR and SSIM at every strength). In September, temporal quality
 was re-measured against the ground truth instead of against zero.
 
-### 3. A real game exposes the gap (October 1 to 3)
+### 3. A real game exposes the gap 
 
 The first goal was real time, so the model was split into a render-resolution accumulator ("fast"), a
 phase-gated variant, and fused CUDA kernels with a TensorRT backend. Two things then went wrong.
@@ -125,7 +125,7 @@ give a clean reference for real game content. An attention-based high-end model 
 tried and underperformed, and a larger convolutional model matched a smaller one, so capacity was not the
 limit.
 
-### 4. A CNN in the style of DLSS (October 3 to 4)
+### 4. A CNN in the style of DLSS 
 
 The state-space part was dropped. The new model is a U-Net CNN with no learned recurrent state that
 predicts a per-pixel Gaussian reconstruction filter over real samples and blends it with rectified,
