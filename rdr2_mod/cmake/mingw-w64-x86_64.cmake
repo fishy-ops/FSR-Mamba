@@ -1,0 +1,15 @@
+# Cross toolchain: llvm-mingw (clang) on macOS/Linux targeting x86_64 Windows.
+# Usage: cmake -DLLVM_MINGW_ROOT=/path/to/llvm-mingw -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake ...
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR AMD64)
+if(NOT LLVM_MINGW_ROOT AND DEFINED ENV{LLVM_MINGW_ROOT})
+  set(LLVM_MINGW_ROOT "$ENV{LLVM_MINGW_ROOT}")
+endif()
+set(_triple x86_64-w64-mingw32)
+set(CMAKE_C_COMPILER   "${LLVM_MINGW_ROOT}/bin/${_triple}-clang")
+set(CMAKE_CXX_COMPILER "${LLVM_MINGW_ROOT}/bin/${_triple}-clang++")
+set(CMAKE_RC_COMPILER  "${LLVM_MINGW_ROOT}/bin/${_triple}-windres")
+set(CMAKE_FIND_ROOT_PATH "${LLVM_MINGW_ROOT}/${_triple}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

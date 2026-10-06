@@ -113,6 +113,7 @@ class MambaAccumulator(nn.Module):
         lock_feature: bool = False,
         alpha_scale: float = 1.0,
         encoder_depth: int = 2,
+        jitter_sign: float = 1.0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -126,6 +127,15 @@ class MambaAccumulator(nn.Module):
         self.lock_feature = lock_feature
         self.alpha_scale = alpha_scale
         self.dev = torch.device(device)
+        # jitter_sign: the captures place a low-res sample at texel centre + jitter, the
+        # opposite of the convention baseline._upsample was ported with (centre - jitter).
+        # Measured: sampling the ground truth at centre + jitter matches the low-res frames
+        # (toyshop MSE 0.66e-4), centre - jitter does not (2.09e-4, worse than no jitter).
+        # -1 feeds every jitter-aware computation the corrected sign; +1 keeps the behaviour
+        # of checkpoints trained before this was found.
+        self.jitter_sign = float(jitter_sign)
+        if self.jitter_sign != 1.0:
+            self.register_buffer("_jitter_sign", torch.tensor(self.jitter_sign))
 
         # Fixed, non-learned front-end: FSR's Lanczos resolve and its
         # rectification box. We borrow the implementation wholesale.
@@ -469,6 +479,9 @@ class MambaAccumulator(nn.Module):
         jitter: tuple[float, float],
         prev_depth_hr: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MambaState]:
+        if self.jitter_sign != 1.0:
+            jitter = (jitter * self.jitter_sign if torch.is_tensor(jitter)
+                      else (float(jitter[0]) * self.jitter_sign, float(jitter[1]) * self.jitter_sign))
         upsampled, _, box_center, box_stddev = self._resolve._upsample(lr_rgb, jitter)
 
         # --- disocclusion, same depth test the baseline uses ---

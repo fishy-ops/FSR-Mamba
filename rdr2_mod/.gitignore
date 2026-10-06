@@ -1,0 +1,12 @@
+.work/
+build*/
+__pycache__/
+*.bin
+*.log
+*.dxil
+*_dxil.h
+*.obj
+*.o
+*.dll
+*.exe
+stage/

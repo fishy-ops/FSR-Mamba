@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from .capture import load_frame
+from .augment import augment_sequence, random_op
 
 
 def _upsample_to(x: torch.Tensor, h: int, w: int, mode: str) -> torch.Tensor:
@@ -139,8 +140,37 @@ def load_engine_scene(scene_dir: str, device: str = "cpu", tonemap: bool = True,
     return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in f.items()} for f in frames]
 
 
+def _gradient_energy(gt):
+    energy = gt.new_zeros(gt.shape[:2], dtype=torch.float32)
+    gt = gt.float()
+    energy[:, 1:] += (gt[:, 1:] - gt[:, :-1]).square().mean(dim=-1)
+    energy[1:] += (gt[1:] - gt[:-1]).square().mean(dim=-1)
+    return energy
+
+
+def _weighted_location(gt, ch, cw, scale, rh, rw, rng, weight_fn):
+    """Pool GT gradient energy at valid crop centres onto a coarse origin grid."""
+    energy = (weight_fn or _gradient_energy)(gt)
+    ny, nx = rh - ch + 1, rw - cw + 1
+    # Origin (y,x) has its centre at output pixel ((y+ch/2)*scale, ...).
+    energy = energy[ch * scale // 2:ch * scale // 2 + ny * scale,
+                    cw * scale // 2:cw * scale // 2 + nx * scale]
+    gh, gw = min(32, ny), min(32, nx)
+    weights = F.adaptive_avg_pool2d(energy[None, None], (gh, gw)).flatten()
+    weights = weights.detach().cpu().tolist()
+    if sum(weights) <= 0:
+        return None  # Flat GT: retain the already-drawn uniform location.
+    index = rng.choices(range(gh * gw), weights=weights, k=1)[0]
+    gy, gx = divmod(index, gw)
+    y = rng.randrange(gy * ny // gh, (gy + 1) * ny // gh)
+    x = rng.randrange(gx * nx // gw, (gx + 1) * nx // gw)
+    return y, x
+
+
 def crop_sequence(frames: list[dict], crop_render: int, scale: int = 2,
-                  rng: random.Random | None = None, edge_bias: float = 0.0) -> list[dict]:
+                  rng: random.Random | None = None, edge_bias: float = 0.0,
+                  augment_rng: random.Random | None = None, edge_prob: float = 0.0,
+                  weight_fn=None, static_pan: int = 0) -> list[dict]:
     """One fixed random crop applied to the whole sequence.
 
     The crop location is constant across frames so the per-pixel recurrent state
@@ -161,15 +191,30 @@ def crop_sequence(frames: list[dict], crop_render: int, scale: int = 2,
     crop -- where a pixel leaving the crop still has valid content just outside it
     -- a pixel leaving a true frame edge IS a genuine disocclusion, so the crop's
     off-edge = disocclusion assumption is physically correct here.
+
+    ``edge_prob`` instead draws crop centres proportionally to first-frame GT
+    gradient energy, average-pooled onto a coarse grid. ``weight_fn(gt)`` may
+    supply an alternative nonnegative (H,W) energy map. ``augment_rng`` enables
+    one shared dihedral transform after cropping; leave it unset for evaluation.
+
+    ``static_pan``: for frozen-world sequences (``f["static"]``), slide the crop by a
+    random whole-render-pixel velocity of up to this many pixels per frame and add the
+    matching motion. The reference is one accumulated image, so the shifted crops are
+    an exact camera pan; content entering at the crop border has no history, as at a
+    real frame edge.
     """
     rng = rng or random
     rh, rw, _ = frames[0]["lr"].shape
     ch = cw = crop_render
     if rh < ch or rw < cw:
-        return frames
+        return augment_sequence(frames, random_op(augment_rng)) if augment_rng is not None else frames
 
     y = rng.randint(0, rh - ch)
     x = rng.randint(0, rw - cw)
+    if edge_prob > 0.0 and rng.random() < edge_prob:
+        location = _weighted_location(frames[0]["gt"], ch, cw, scale, rh, rw, rng, weight_fn)
+        if location is not None:
+            y, x = location
     if edge_bias > 0.0 and rng.random() < edge_bias:
         side = rng.choice(("top", "bottom", "left", "right"))
         if side == "top":
@@ -180,16 +225,27 @@ def crop_sequence(frames: list[dict], crop_render: int, scale: int = 2,
             x = 0
         else:
             x = rw - cw
-    Y, X, CH, CW = y * scale, x * scale, ch * scale, cw * scale
+    vx = vy = 0
+    if static_pan > 0 and frames[0].get("static", False):
+        n = len(frames) - 1
+        vx = rng.randint(-min(static_pan, (rw - cw) // max(n, 1)), min(static_pan, (rw - cw) // max(n, 1)))
+        vy = rng.randint(-min(static_pan, (rh - ch) // max(n, 1)), min(static_pan, (rh - ch) // max(n, 1)))
+        x = rng.randint(max(0, -vx * n), rw - cw - max(0, vx * n))
+        y = rng.randint(max(0, -vy * n), rh - ch - max(0, vy * n))
+    x0, y0 = x, y
     mv_rescale = torch.tensor([rw / cw, rh / ch], device=frames[0]["mv"].device)
+    # Content at crop pixel p was at p + v in the previous frame's crop.
+    pan = torch.tensor([vx / cw, vy / ch], device=frames[0]["mv"].device)
 
     out = []
-    for f in frames:
+    for t, f in enumerate(frames):
+        x, y = x0 + t * vx, y0 + t * vy
+        Y, X, CH, CW = y * scale, x * scale, ch * scale, cw * scale
         # Cast to float32 here, not upstream: the full sequences may be held in fp16
         # to fit in RAM (see load_engine_scene's `half`), but every consumer of a crop
         # -- the resolve, the metrics, the warp -- needs float32. The crop is tiny, so
         # converting at this boundary costs nothing and keeps fp16 out of the maths.
-        mv_c = f["mv"][y:y + ch, x:x + cw].float() * mv_rescale
+        mv_c = f["mv"][y:y + ch, x:x + cw].float() * mv_rescale + (pan if t else 0)
         depth_c = f["depth"][y:y + ch, x:x + cw].float()
         c = {
             "lr": f["lr"][y:y + ch, x:x + cw].float(),
@@ -200,8 +256,10 @@ def crop_sequence(frames: list[dict], crop_render: int, scale: int = 2,
         }
         if "fsr_out" in f:
             c["fsr_out"] = f["fsr_out"][Y:Y + CH, X:X + CW].float()
+        if "mask" in f:   # 1 where the reference is valid (accumulated game references: stable pixels)
+            c["mask"] = f["mask"][Y:Y + CH, X:X + CW].float()
         out.append(c)
-    return out
+    return augment_sequence(out, random_op(augment_rng)) if augment_rng is not None else out
 
 
 def list_scenes(captures_dir: str) -> list[str]:
@@ -224,3 +282,40 @@ def list_scenes(captures_dir: str) -> list[str]:
         if has_raw or has_cache:
             names.append(os.path.basename(d))
     return names
+
+
+def load_extra_engine_scenes(captures_dir, train_names, val_names, test_names,
+                             scale, bptt):
+    """Load compatible extra captures whose base scene belongs to training.
+
+    Game captures named ``rdr2_*`` have no engine base scene and always train.
+    """
+    names = list_scenes(captures_dir)
+    held_out = set(val_names) | set(test_names)
+    training = set(train_names) | {"rdr2"}
+    excluded = [s for s in names if s.split("_", 1)[0] in held_out]
+    unknown = [s for s in names if s.split("_", 1)[0] not in training | held_out]
+    print(f"  extra excluded (validation/test base): {excluded}")
+    print(f"  extra excluded (unknown base): {unknown}")
+    kept = [s for s in names if s.split("_", 1)[0] in training]
+    leaked = [s for s in kept if s.split("_", 1)[0] in held_out]
+    if leaked:
+        raise SystemExit(f"extra captures contain validation/test scenes {leaked}; "
+                         "training on them would leak")
+    loaded = []
+    for name in kept:
+        frames = load_engine_scene(os.path.join(captures_dir, name), device="cpu", half=True)
+        if len(frames) < bptt:
+            print(f"  extra skip {name}: {len(frames)} frames < --bptt {bptt}")
+            continue
+        for f in frames:
+            rh, rw = f["lr"].shape[:2]
+            uh, uw = f["gt"].shape[:2]
+            if uh != rh * scale or uw != rw * scale:
+                print(f"  extra skip {name}: render {rh}x{rw} -> output {uh}x{uw} "
+                      f"does not match --scale {scale:g}")
+                break
+        else:
+            loaded.append((name, frames))
+    print(f"  extra kept: {[name for name, _ in loaded]}")
+    return loaded

@@ -1,262 +1,213 @@
 # FSR-Mamba
 
-A **learned temporal accumulator** that replaces the hand-tuned heuristics in
-AMD's FidelityFX Super Resolution 3.1.4 with a selective state-space model
-(SSM), kernel-prediction output head, and learned low-resolution upsampler.
+A learned temporal upscaler in the style of DLSS: a convolutional network that takes the jittered
+low-resolution frame, motion vectors, depth and its own previous output, and reconstructs the
+high-resolution frame. It is trained on 4x supersampled ground truth captured from Unreal Engine 5
+and runs in a shipping game through a DirectX 12 proxy DLL. AMD's FidelityFX Super Resolution
+(FSR 3.1.4) is the baseline it is measured against.
 
-Trained on 4x SSAA ground truth captured from Unreal Engine 5, evaluated at
-full frame (1280x710) on held-out scenes.
+The project began as a selective state-space (Mamba) accumulator, which is where the name comes
+from. The current model is a plain CNN with no recurrent state; the state-space prototype is kept
+as the research history.
 
-## Current best (v64)
+The repository has three parts:
 
-Full-frame evaluation on 3 held-out UE5 scenes (bistro, brutalism, chess),
-72 frames, 640x355 render → 1280x710 output:
+1. **Training and evaluation** (`prototype/`): PyTorch models, training and metrics.
+2. **Engine capture** (`engine_capture/`): a patch and driver script that dump colour, motion
+   vectors, depth and 4x SSAA ground truth from UE5's FSR integration.
+3. **Game runtime** (`rdr2_mod/`): a DirectX 12 proxy DLL (HLSL compute shaders plus DirectML)
+   that runs the trained network in place of FSR 2 in Red Dead Redemption 2 (story mode only).
 
-| | PSNR (dB) | SSIM | Temporal instability ↓ |
+## Results
+
+Full-frame evaluation on three held-out UE5 scenes (bistro, brutalism, chess), against 4x SSAA
+ground truth, with FSR 3.1.4 captured from the same engine as the baseline.
+
+| Metric | FSR 3.1.4 | CNN (`kpn6_s2`) |
+|---|---|---|
+| PSNR (dB) | 31.01 | **31.79** (+0.78) |
+| SSIM | 0.9557 | **0.9579** (+0.0022) |
+| Temporal deviation from ground truth (lower is better) | 0.00249 | **0.00235** |
+| Frame-to-frame temporal change | 0.01548 | 0.01561 |
+
+The CNN beats FSR on PSNR, SSIM and ground-truth-referenced temporal deviation. Raw
+frame-to-frame change is a poor quality metric on its own (a perfect result still changes when the
+scene moves), so it is reported but not optimised.
+
+**Runtime cost.** On an RTX 2070 SUPER at 720p to 1440p, the DirectML build takes about 4.0 ms
+per frame (pack 0.66, network 2.3, resolve 0.9), against roughly 1.2 ms for FSR 2. That is above
+the original 2 ms goal; the DirectML network floor is about 1.8 ms even for a tiny trunk.
+
+**In game.** In Red Dead Redemption 2 the model resolves fine detail such as hair and texture
+better than FSR 2. Foliage shimmer is the main open problem. A live temporal stabiliser
+(`rdr2_mod`, preset 5) reduces it, and measuring it properly on moving footage is the next step.
+
+## Approach
+
+**Current model: a kernel-prediction CNN.** Like DLSS, the network sees what the renderer provides
+(jittered colour, motion vectors, depth) plus the previous output, and accumulates samples over
+time. It is a kernel-prediction design, not a reproduction of any proprietary model.
+
+- **Inputs**: 16 channels at render resolution: current colour, reprojected history, history
+  minus current (normalised by local range), depth mismatch and disocclusion, motion length,
+  history age and the sub-pixel jitter.
+- **Network**: a U-Net trunk of convolutions, max-pools, bilinear resamples and ReLUs. In the
+  real-time configuration it runs at half render resolution (stride 2) and is exported to DirectML.
+- **Outputs**: seven values per output pixel: an anisotropic Gaussian (two log-sigmas and an
+  angle) over real render-resolution samples, a blend weight for the current frame, a history
+  clamp slack and a small colour residual. The result is built from observed colours, so it
+  cannot diverge.
+- **Accumulation**: history is reprojected with exact Catmull-Rom filtering and weighted by how
+  close each sample lands to the output pixel centre. Packing, reprojection, depth rejection and
+  the final resolve run in compute shaders; only the trunk runs on DirectML.
+- **No recurrent state**: the only things carried between frames are the output colour, the
+  per-pixel history age and the previous depth.
+
+Cost fell from 9.2 ms to about 4 ms by moving to the stride-2 trunk, three-tap kernels, fp16
+storage and shared-memory tiles in the shaders.
+
+**Earlier prototype: a state-space accumulator (v1 to v67).** A selective state-space model carried
+per-pixel temporal state along motion vectors and drove a learned blend, history-rectification box
+scale, kernel-prediction head and render-resolution upsampler. Best result on the same held-out
+scenes at 1280x710:
+
+| | PSNR (dB) | SSIM | Temporal instability |
 |---|---|---|---|
 | AMD FSR 3.1.4 | 30.87 | 0.9549 | 0.02153 |
-| **FSR-Mamba v64** (372k params) | **31.38** (+0.51) | **0.9546** (−0.0003) | 0.02296 (+0.00143) |
+| State-space v64 (372k params) | 31.38 | 0.9546 | 0.02296 |
 
-PSNR: **+0.51 dB** ahead of FSR. SSIM gap is **0.0003** — visually
-indistinguishable. Temporal stability is the one remaining metric to close.
+It matched FSR on image quality but was too slow for a game. The CNN above has no recurrent
+state and beats this prototype and FSR on PSNR, SSIM and temporal deviation.
 
-## Architecture
+## How the project evolved
 
-The model keeps FSR's overall pipeline shape — Lanczos resolve, motion-vector
-reprojection, history rectification, alpha blending — but replaces the
-hand-tuned accumulation rules with learned components.
+Eleven weeks and more than 70 trained models, in four stages. The commit history up to September covers
+the first two; October's work is squashed into the last commit.
 
-**Yes, the selective state-space model (SSM) is still the core temporal mechanism
-in the final v64 checkpoint.** The SSM was never replaced — later additions
-(kernel prediction head, LR upsampler) work *alongside* it, not instead of it.
-The SSM's per-pixel state `h` carries temporal memory across frames; its output
-`y` feeds into both the alpha blend and the KPN head as their primary feature
-signal.
+### 1. A learned accumulator (July)
+
+The baseline was a Python port of FSR 3.1.4's accumulation pass, checked against AMD's HLSL. On top
+of it went a selective state-space (Mamba) accumulator whose per-pixel state is warped along motion
+vectors. Trained on procedurally generated motion with known ground truth, it was 4.5x more
+temporally stable than the ported baseline (instability 0.0063, PSNR 20.44, SSIM 0.831). That showed
+the idea worked, but synthetic data could not say anything about real rendering.
+
+### 2. Real engine data and the search for quality (July to September)
+
+A UE5 capture harness dumps colour, motion vectors, depth and a 4x SSAA ground truth for ten scenes
+(seven train, three validation). Training on real captures changed what mattered: real disocclusion
+and texture detail, not synthetic motion.
+
+| Milestone | Result on held-out scenes |
+|---|---|
+| Render-resolution upsampler (v17) | Broke the Lanczos ceiling of about 0.9425 SSIM |
+| Kernel-prediction head (v39) | Fixed the recurrent divergence; output cannot leave the range of real colours |
+| U-Net encoder (v56) | 20x cheaper (28.9 vs 592 GFLOP), 1.69 ms, but SSIM 0.0135 below FSR |
+| SSIM and gradient losses, warm start (v64) | PSNR +0.51 dB over FSR, SSIM within 0.0003 |
+
+Dead ends from this stage: expert routing, Swin-transformer refiners, separable convolutions at small
+widths, and RCAS sharpening (it lowered PSNR and SSIM at every strength). In September, temporal quality
+was re-measured against the ground truth instead of against zero.
+
+### 3. A real game exposes the gap (October 1 to 3)
+
+The first goal was real time, so the model was split into a render-resolution accumulator ("fast"), a
+phase-gated variant, and fused CUDA kernels with a TensorRT backend. Two things then went wrong.
+
+- A bug found on October 2: the captures sample at texel centre plus jitter, but the ported baseline
+  assumed minus. Every jitter-aware model trained before that had used the wrong sign.
+- On October 2 the model went into Red Dead Redemption 2 through a proxy DLL. It did not look better
+  than FSR 2: edges flickered, hair and grass were worse. Metrics on engine captures had not
+  predicted that, and the game footage had no ground truth.
+
+The response was new data and a new target. Photo mode freezes the world, so 64 frames of accumulation
+give a clean reference for real game content. An attention-based high-end model (`--arch hq`) was
+tried and underperformed, and a larger convolutional model matched a smaller one, so capacity was not the
+limit.
+
+### 4. A CNN in the style of DLSS (October 3 to 4)
+
+The state-space part was dropped. The new model is a U-Net CNN with no learned recurrent state that
+predicts a per-pixel Gaussian reconstruction filter over real samples and blends it with rectified,
+reprojected history, a data flow similar to DLSS 2, trained on this project's own captures.
+
+| Step | Effect |
+|---|---|
+| CNN replaces the state-space accumulator | Only convolutions, pooling, resampling and ReLU, so it exports cleanly to DirectML |
+| Proximity-weighted accumulation | Nearest-sample blending was acting like a two-pixel box blur. Fixing it took a held-out frozen frame from 33.06 to 34.59 dB with no retraining |
+| Stride-2 trunk, 3-tap kernels, fp16 shaders | 9.2 ms down to about 4 ms per frame |
+| Fine-tune on engine plus frozen game shots (`kpn6_s2`) | Beats FSR on PSNR, SSIM and temporal deviation: 31.79 dB, 0.9579, 0.00235 |
+| Live stabiliser, foliage tracker, presets | Tunable shimmer control in game; the plain stabiliser (preset 5) looked best |
+
+Open: cost is still twice the original 2 ms goal, and foliage shimmer needs a proper metric on
+moving footage instead of judging by eye.
+
+The two result tables in this README come from different evaluation protocols (full 1280x710 frames
+for the state-space prototype, multi-scene full-frame for the CNN), so compare each model with the FSR
+baseline in its own table, not across tables.
+
+### Lessons
+
+- Warm-starting from a good checkpoint accounts for most of the quality; training from scratch
+  needs 30+ epochs to reach the same level.
+- Encoder width sets the SSIM ceiling at fixed training signal; extra losses did not move it.
+- RCAS sharpening lowers both PSNR and SSIM at every strength.
+- Nearest-sample accumulation behaves like a two-pixel box blur. Proximity-weighted blending
+  removed it and gained about 1.5 dB on a held-out frozen frame.
+- A sign error in the jitter convention affected every jitter-aware model trained before it was
+  found. The UE5 captures use sample position = texel centre + jitter while FSR 2 titles use the
+  opposite convention, so the runtime exposes per-axis flips.
+
+## Repository layout
 
 ```
-LR input (540p) ─────────────────────────────┐
-  │                                           │
-  ├── FSR Lanczos resolve ── upsampled (1080p)│
-  │                                           │
-  ├── Flat encoder (2×conv3×3)                │
-  │     └── SSM projections (Δ, B, C, X)      │
-  │           └── Selective state update ──────┤  ← temporal backbone
-  │                 │                          │    (h carries memory
-  │                 │                          │     across frames)
-  │                 ├── Learned alpha blend    │
-  │                 │     └── History rectification (learned box scale)
-  │                 │
-  │                 └── Kernel prediction head (KPN)
-  │                       ├── LR taps at output res
-  │                       ├── Rectified history
-  │                       └── Current resolve
-  │                             ↓
-  └── LR Upsampler (4×ResBlock + PixelShuffle)── high-freq residual
-                                                    ↓
-                                              Output (1080p)
+prototype/
+  train.py               training (--arch kpn is the current model)
+  eval_full.py           full-frame evaluation against ground truth
+  eval_temporal.py       temporal-quality evaluation
+  bench_latency.py       GPU latency benchmark
+  fsrmamba/
+    kpn.py, kpn_unet.py  kernel-prediction CNN (the current model)
+    mamba.py             earlier state-space accumulator
+    fast.py, fused.py    fast variant and fused CUDA kernels
+    lrnet.py             learned render-resolution upsampler
+    baseline.py          ported FSR 3.1.4 accumulator (reference)
+    engine_data.py       UE5 capture loader
+    metrics.py, evalkit.py   losses and evaluation
+  tools/                 ONNX export, latency sweeps, result collection
+  tests/                 unit and parity tests (python tests/run_all.py)
+engine_capture/          UE5 capture patch and orchestrator
+rdr2_mod/                DX12 proxy DLL, shaders, weight exporter, tests
 ```
 
-### How the SSM and KPN work together
-
-The **SSM** handles the *temporal* question: for each pixel, how much to trust
-the accumulated history vs the current frame. It maintains a hidden state `h`
-that is warped along motion vectors each frame and updated via input-dependent
-gates (the selective scan from Mamba):
-
-```
-delta = softplus(to_delta(enc))       # per-pixel forget rate
-a_bar = exp(-delta)                   # decay gate
-h = a_bar * h_prev + (1-a_bar) * B(enc) * X(enc)   # state update
-y = C(enc) * h                        # readout
-```
-
-The **KPN** handles the *spatial* question: given the SSM's temporal readout
-`y` and the encoder features, predict per-pixel softmax weights over 11 real
-candidate colours (9 LR taps + warped history + Lanczos resolve). The output
-is a convex combination — bounded by definition, so it cannot diverge through
-the recurrence. This solved the stability collapse that killed v15–v17.
-
-### Other key components
-
-- **History rectification**: FSR's anisotropic YCoCg colour box clamp, but with a
-  *learned* per-pixel box scale in [1, box_max] instead of FSR's velocity-based
-  heuristic. Prevents stale smooth history from overriding sharp current-frame detail.
-
-- **LR Upsampler**: 4-layer ResNet at render resolution with PixelShuffle 2×
-  expansion. Recovers high-frequency detail the fixed Lanczos 3×3 taps discard.
-  FiLM conditioning on sub-pixel jitter offset for phase-aware reconstruction.
-  82% of model parameters, but cheap (runs at 1/4 pixel count).
-
-- **Robust disocclusion**: Neighbourhood depth envelope test (3×3 min/max + tolerance)
-  instead of FSR's per-pixel depth test, preventing false disocclusion on geometric
-  edges that would kill temporal anti-aliasing.
-
-## Iteration history
-
-67 experiments across 4 phases of development. Key milestones:
-
-### Phase 1: Synthetic data (v1–v10)
-Trained on procedurally generated motion + known ground truth. Proved the
-SSM-based accumulator concept works. Best synthetic result: PSNR 20.44, SSIM
-0.831, temporal instability 0.0063 (4.5× better than the ported FSR baseline).
-
-### Phase 2: Real engine captures (v11–v38)
-Switched to 4× SSAA captures from Unreal Engine 5 (10 scenes, 7 train / 3 val).
-This changed everything — real motion vectors, real disocclusion patterns, real
-texture complexity. Explored: expert routing (no benefit on this data), Swin
-transformer refiners, perceptual/frequency losses, learned spatial resolve.
-
-### Phase 3: Architecture search (v39–v56)
-Systematic exploration of the quality–latency frontier:
-- **LR Upsampler** (v17+): Broke the Lanczos-resolve ceiling at ~0.9425 SSIM
-  by giving the model direct access to raw LR samples.
-- **Kernel prediction** (v39+): Solved the recurrent divergence problem. Output
-  is a convex combination of real colours, so it cannot compound through the
-  accumulation.
-- **U-Net encoder** (v56): 28.9 GFLOP vs 592 GFLOP (20× cheaper) by running
-  convolutions at 1/8 resolution. 1.69 ms measured on GPU — fits the real-time
-  budget. Quality gap remains (SSIM −0.0135 vs FSR) — the path forward for
-  latency.
-- **Separable convolutions** (v58–v59): 7.9× cheaper per conv layer, but
-  representation-limited at small channel counts. Non-separable wins.
-
-### Phase 4: Quality push (v61–v67)
-Closed the texture sharpness gap to FSR:
-- **v61** (32ch non-sep, crop 128): SSIM 0.9502 on crops but 0.9392 at full
-  frame — crop-to-full generalization gap.
-- **v63** (32ch non-sep, crop 256): Fixed the generalization gap (0.0044 vs
-  0.0110) but 32ch encoder is capacity-limited. Full-frame SSIM 0.9394.
-- **v64** (48ch non-sep, warm-start from v52 + SSIM/gradient/edge-gradient
-  losses): **New best.** Full-frame SSIM 0.9546 (−0.0003 vs FSR), PSNR +0.51.
-  Proved the improvement comes from better training signal, not more capacity.
-- **v65** (3× SSIM weight): Confirmed the SSIM ceiling is architectural, not
-  loss-driven. Identical result to v64.
-- **v67** (temporal-focused): Alpha penalty + high temporal weight. Marginal
-  crop-temporal improvement, but best-selection criterion saved epoch-0 weights.
-
-### Key findings
-
-1. **Encoder channel count sets the SSIM ceiling.** 32ch caps at ~0.9438 on
-   crops regardless of crop size, loss weights, or training length. 48ch reaches
-   ~0.9618. This is architectural, not tunable.
-
-2. **Warm-starting is 90% of quality.** v64 started at SSIM 0.9618 on epoch 0
-   (from v52's weights). Training from scratch starts at 0.9311 and takes 30+
-   epochs to reach ~0.94.
-
-3. **RCAS post-processing hurts.** FSR's Robust Contrast Adaptive Sharpening
-   makes both PSNR and SSIM worse at every strength. The texture gap is internal
-   to the model's representation, not fixable with post-processing.
-
-4. **The flat encoder is the latency bottleneck.** Two 48×48 3×3 convs at full
-   output resolution cost 592 GFLOP/frame at 1080p. The U-Net path (v56) runs
-   the same capacity at 1/8 resolution for 28.9 GFLOP — the path to real-time.
-
-## Full-frame scoreboard
-
-All numbers: full-frame 1280×710, 3 held-out UE5 scenes, 72 frames.
-Ground truth: 4× SSAA at 2560×1420, area-downsampled.
-
-| Version | Architecture | Params | PSNR gap | SSIM gap | Temporal gap |
-|---------|-------------|--------|----------|----------|-------------|
-| v52 | 48ch flat, lr_dim 64 | 372k | +0.48 | −0.0005 | +0.00143 |
-| **v64** | **48ch flat, lr_dim 64, sharp losses** | **372k** | **+0.51** | **−0.0003** | **+0.00143** |
-| v56 | U-Net (3 levels), lr_dim 64 | 924k | −0.74 | −0.0135 | +0.00191 |
-| v63 | 32ch flat, crop 256 | 349k | −0.61 | −0.0155 | +0.00353 |
-| v61 | 32ch flat, crop 128 | 124k | −0.61 | −0.0157 | +0.00408 |
-
-## Training
-
-### Data
-
-Training uses 4× supersampled captures from Unreal Engine 5. Each frame
-includes: LR colour (540p), motion vectors, depth, and the SSAA ground truth
-(1080p area-downsampled from 2160p).
-
-10 scenes total:
-- **Train** (7): hangar, hybridrefl, locomotive, spaceship, sponza, table, toyshop
-- **Val** (3): bistro, brutalism, chess
-
-The capture pipeline (`engine_capture/`) patches UE5's FSR integration to dump
-per-frame data during gameplay.
-
-### Training a model
+## Getting started
 
 ```bash
 cd prototype
+python tests/run_all.py                       # CPU-safe test suite
 
-# From scratch (48ch, 60 epochs, ~35 min on RTX 3070 Ti)
-python train.py \
-  --engine-data /path/to/captures_ssaa \
-  --crop 256 --epochs 60 --bptt 5 --device cuda \
-  --val-scenes 3 --eval-crops 3 --eval-every 6 \
-  --state-channels 24 --feature-channels 48 \
-  --lr 3e-4 --rectify --robust-disocc --kernel-predict \
-  --lr-upsampler --lr-dim 64 \
-  --ssim-weight 1.0 --grad-weight 0.3 --edge-grad-weight 0.15 \
-  --temporal-weight 0.3 \
-  --save out/my_model.pt
+# train the real-time model on engine captures
+python train.py --engine-data /path/to/captures_ssaa --arch kpn \
+  --crop 256 --epochs 50 --val-scenes 3 --device cuda --save ../ckpt/kpn.pt
 
-# Fine-tune from an existing checkpoint (recommended)
-python train.py \
-  --engine-data /path/to/captures_ssaa \
-  --crop 256 --epochs 30 --lr 1e-4 \
-  --init-from out/beat_fsr_v64_sharp.pt \
-  --distill-from out/beat_fsr_v64_sharp.pt --distill-weight 0.5 \
-  ... # same architecture flags as above
-  --save out/my_finetuned.pt
+# fine-tune from an existing checkpoint (lower the learning rate: Adam state is not saved)
+python train.py ... --init-from ../ckpt/kpn.pt --lr 1e-4 --save ../ckpt/kpn_ft.pt
+
+python eval_full.py --help                    # full-frame evaluation
 ```
 
-### Key training flags
+`python train.py --help` lists every option. Captures are not included; `engine_capture/README.md`
+describes how to produce them from UE5. Checkpoints and datasets are git-ignored.
 
-| Flag | Description |
-|------|-------------|
-| `--feature-channels` | Encoder width (24/32/48). Sets the quality ceiling. |
-| `--encoder-depth` | Number of encoder conv layers (default 2). |
-| `--crop` | Training crop size. 256 recommended for full-frame generalization. |
-| `--kernel-predict` | Use KPN output head (convex combination, no divergence). |
-| `--lr-upsampler` | Enable learned LR-domain upsampler. |
-| `--lr-dim` | LR upsampler width (64 recommended). |
-| `--rectify` | Enable learned history rectification. |
-| `--init-from` | Warm-start weights (strict=False, cross-architecture OK). |
-| `--distill-from` | Teacher checkpoint for knowledge distillation. |
-| `--ssim-weight` | Weight on (1 − SSIM) loss. |
-| `--grad-weight` | Weight on gradient-L1 loss (edge sharpness). |
-| `--edge-grad-weight` | Weight on edge-weighted gradient loss. |
-| `--temporal-weight` | Weight on temporal consistency loss. |
-
-## Layout
-
-```
-README.md                     This file
-prototype/
-  train.py                    Training script with all flags
-  fsrmamba/
-    mamba.py                  Core model: SSM accumulator + all heads
-    kpn.py                    Kernel prediction output head
-    lrnet.py                  Learned LR-domain upsampler
-    unet.py                   U-Net encoder (latency-optimised path)
-    swin.py                   Swin transformer resolve refiner
-    sepconv.py                Depthwise-separable convolution wrapper
-    metrics.py                PSNR, SSIM, temporal, gradient, perceptual, freq losses
-    engine_data.py            UE5 SSAA capture loader
-    baseline.py               Ported FSR 3.1.4 accumulator (reference)
-    colorspace.py             RGB ↔ YCoCg conversion
-    cropbank.py               Pre-cropped training bank
-    capture.py                Frame capture utilities
-    synth.py                  Synthetic data generator (phase 1)
-engine_capture/
-  capture_scenes.py           Multi-scene UE5 capture orchestrator
-  fsrapi_capture.patch        UE5 FSR integration patch for data dumping
-```
+To run a model in a game, see [`rdr2_mod/README.md`](rdr2_mod/README.md).
 
 ## Attribution
 
-`prototype/fsrmamba/baseline.py` and `colorspace.py` are derived from AMD's
-FidelityFX SDK (MIT licence, Copyright (c) 2024 Advanced Micro Devices, Inc.),
-with line references to the original HLSL throughout. FSR 3.1.4 is the newest
-version AMD published source for.
+`prototype/fsrmamba/baseline.py` and `colorspace.py` derive from AMD's FidelityFX SDK
+(MIT licence, Copyright (c) 2024 Advanced Micro Devices, Inc.). `rdr2_mod/third_party/fsr2`
+contains the FSR 2 API headers needed for the proxy DLL, under their original licence.
+This is an independent research project and is not affiliated with AMD or Rockstar Games.
 
-## License
+## Licence
 
 MIT

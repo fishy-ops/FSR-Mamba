@@ -43,6 +43,7 @@ import time
 import torch
 
 from .engine_data import load_engine_scene
+from .augment import augment_sequence, random_op
 
 
 def build_bank(captures_dir: str, scenes: list[str], out_path: str,
@@ -132,7 +133,8 @@ def load_bank(path: str) -> list[dict]:
 
 
 def sample_from_window(entry: dict, crop_render: int, scale: int, rng,
-                       edge_bias: float = 0.0, frames: int | None = None):
+                       edge_bias: float = 0.0, frames: int | None = None,
+                       augment_rng=None):
     """Draw one training sequence out of a stored window.
 
     Mirrors `crop_sequence`'s contract exactly -- same keys, same float32 cast, same
@@ -203,4 +205,4 @@ def sample_from_window(entry: dict, crop_render: int, scale: int, rng,
             "gt": entry["gt"][i, Y:Y + CH, X:X + CW].float(),
             "jitter": entry["jitter"][i],
         })
-    return out
+    return augment_sequence(out, random_op(augment_rng)) if augment_rng is not None else out
