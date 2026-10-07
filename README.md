@@ -40,7 +40,40 @@ the original 2 ms goal; the DirectML network floor is about 1.8 ms even for a ti
 
 **In game.** In Red Dead Redemption 2 the model resolves fine detail such as hair and texture
 better than FSR 2. Foliage shimmer is the main open problem. A live temporal stabiliser
-(`rdr2_mod`, preset 5) reduces it, and measuring it properly on moving footage is the next step.
+(`rdr2_mod`, preset 5) reduces it; the moving benchmark comparison below measures the deployed
+pipeline against a common native-resolution reference.
+
+### Red Dead Redemption 2 benchmark
+
+The deployed CNN, AMD FSR 3.1.4 and CNN-era DLSS 3.8.10 (preset E), each rendering at
+**1280x720 to 2560x1440**, compared against a native **2560x1440 high-TAA** reference on
+an **RTX 2070 SUPER**. Measured on October 6, 2026, using **41 common aligned frame pairs**
+across five benchmark scenes.
+
+| Method | PSNR (dB) ↑ | SSIM ↑ | Temporal error ↓ |
+|---|---:|---:|---:|
+| Deployed CNN (720p to 1440p) | 29.586 | 0.8154 | **0.02924** |
+| FSR 3.1.4 | 29.319 | 0.8024 | 0.03140 |
+| DLSS 3.8.10, preset E | **29.960** | **0.8254** | 0.02991 |
+
+In this sample, the CNN scored above FSR 3.1.4 on all three metrics. DLSS led PSNR and SSIM;
+the CNN had the lowest temporal error. The CNN row includes the deployed stabiliser
+(`stabilize=0.85`). FSR 3.1.4 was verified through OptiScaler with the game's native FSR inputs,
+and the DLSS driver override was disabled to keep preset E active.
+
+Lossless RGB recordings were sampled at 15 FPS, with the bottom 100 pixels containing the
+benchmark HUD cropped. Temporal error is `mean(abs((method_next - method_current) -
+(TAA_next - TAA_current)))` on RGB values in [0,1], over approximately 66.7 ms. It measures
+frame-difference residual, rather than motion-compensated flicker. These exploratory results
+have a separate protocol from the UE5 table above: native TAA is a reference proxy, and
+independent runs vary in NPCs, lighting, particles and timing. Small differences need broader
+validation; this quality comparison does not measure uncapped performance.
+
+![Shop close-up: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_shop_closeup.png)
+
+*Shop close-up from the recorded benchmark passes: the same 1300x800 crop at original pixel
+size, showing hair, fabric and the engraved register. Small pose and timing differences remain
+between runs. The table averages all five scenes, not only this shot.*
 
 ## Approach
 
@@ -200,6 +233,18 @@ python eval_full.py --help                    # full-frame evaluation
 describes how to produce them from UE5. Checkpoints and datasets are git-ignored.
 
 To run a model in a game, see [`rdr2_mod/README.md`](rdr2_mod/README.md).
+
+## Remaining improvements
+
+Two visible artifacts remain in moving gameplay:
+
+- **Residual ghosting:** a small amount of trailing remains in some moving details. Improve
+  history rejection and clamping around motion and disocclusion while retaining fine detail.
+- **Distant-tree flicker:** fine branches and foliage can flicker or shimmer far from the camera.
+  Improve selective temporal stabilisation and history confidence without blurring those details.
+
+Validate changes on full-resolution moving clips with camera pans, distant foliage and newly
+revealed surfaces. The benchmark scores above do not replace checking these artifacts in motion.
 
 ## Attribution
 
