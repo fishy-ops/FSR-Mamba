@@ -75,6 +75,11 @@ validation; this quality comparison does not measure uncapped performance.
 size, showing hair, fabric and the engraved register. Small pose and timing differences remain
 between runs. The table averages all five scenes, not only this shot.*
 
+![Cash-register detail: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_shop_register_detail.png)
+
+*Tighter 620x520 cash-register crops from the exact same frames as the shop comparison
+above, with the same layout and labels. Each crop retains the original pixels.*
+
 ## Approach
 
 **Current model: a kernel-prediction CNN.** Like DLSS, the network sees what the renderer provides
