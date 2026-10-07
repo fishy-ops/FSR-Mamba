@@ -69,16 +69,21 @@ have a separate protocol from the UE5 table above: native TAA is a reference pro
 independent runs vary in NPCs, lighting, particles and timing. Small differences need broader
 validation; this quality comparison does not measure uncapped performance.
 
-![Shop close-up: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_shop_closeup.png)
+![City chase: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_city_chase_scene.png)
 
-*Shop close-up from the recorded benchmark passes: the same 1300x800 crop at original pixel
-size, showing hair, fabric and the engraved register. Small pose and timing differences remain
-between runs. The table averages all five scenes, not only this shot.*
+*City-chase frames matched by camera position from the recorded benchmark passes. The same
+1300x800 crop is retained at original pixel size. NPCs, particles and timing vary between
+independent runs; the quality table averages all five benchmark scenes.*
 
-![Cash-register detail: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_shop_register_detail.png)
+![City-chase facade detail: native TAA, deployed CNN, FSR 3.1.4 and DLSS preset E](docs/images/rdr2_city_chase_detail.png)
 
-*Tighter 620x520 cash-register crops from the exact same frames as the shop comparison
-above, with the same layout and labels. Each crop retains the original pixels.*
+*Tighter 620x520 crops of the balcony, railing and awning from the same frames above,
+with the same layout and labels. Each crop retains the original pixels.*
+
+[Watch or download the city-chase comparison (MP4, 7.31 MB)](docs/videos/rdr2_city_chase.mp4)
+
+*Eight-second four-way comparison, 2560x1440 at 15 FPS. The video is compressed for sharing;
+inspect the PNG crops for still-image detail. Capture cadence does not measure game FPS.*
 
 ## Approach
 
