@@ -86,6 +86,39 @@ with the same layout and labels. Each crop retains the original pixels.*
 *Eight-second four-way comparison, 2560x1440 at 15 FPS. The video is compressed for sharing;
 inspect the PNG crops for still-image detail. Capture cadence does not measure game FPS.*
 
+### RDR2 performance
+
+Uncapped built-in benchmark, measured October 7, 2026: **Performance mode, 1280x720 to 2560x1440**,
+RTX 2070 SUPER and Intel Core i7-9700, with the same graphics settings for all three methods.
+Two complete passes per method; the table reports RDR2's own end-of-benchmark average FPS.
+
+| Method | Run 1 FPS | Run 2 FPS | Mean FPS |
+|---|---:|---:|---:|
+| Deployed CNN | 78.8 | 79.1 | **78.9** |
+| FSR 3.1.4 | 92.9 | 93.2 | **93.0** |
+| DLSS 3.8.10, preset E | 98.8 | 99.0 | **98.9** |
+
+The CNN numbers include the complete custom-DLL pipeline: feature packing and reprojection,
+DirectML network execution, and temporal resolve/stabilisation, plus the integration work in the
+proxy DLL. These costs are already reflected in the measured FPS. Their individual contribution
+has not been isolated; further runtime optimisation may improve performance, but no adjusted
+FPS or estimated speedup is claimed.
+
+CNN averaged **15.1% below FSR** and **20.2% below DLSS**
+in this test. These performance percentages are separate from the image-quality metrics above.
+
+All methods used MSI Afterburner **+165 MHz core / +400 MHz memory**, **100% fan**, and the
+stock **215 W power limit**. VSync, triple buffering, sharpening, motion blur and frame generation
+were disabled. Unnecessary background applications and overlays were closed. Between passes,
+the game was closed for at least 60 seconds and the GPU cooled to 45°C or below.
+
+![RDR2 average FPS comparison](docs/images/rdr2_fps_comparison.png)
+
+[Protocol, per-run results and diagnostic frame times](docs/performance/rdr2_2026-10-07.md).
+These are measurements of the deployed pipelines on this overclocked system; FSR and DLSS
+use OptiScaler as their integration bridge. Two passes check repeatability but are not a broad
+hardware or scene survey.
+
 ## Approach
 
 **Current model: a kernel-prediction CNN.** Like DLSS, the network sees what the renderer provides
