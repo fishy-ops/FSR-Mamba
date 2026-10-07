@@ -47,17 +47,18 @@ pipeline against a common native-resolution reference.
 
 The deployed CNN, AMD FSR 3.1.4 and CNN-era DLSS 3.8.10 (preset E), each rendering at
 **1280x720 to 2560x1440**, compared against a native **2560x1440 high-TAA** reference on
-an **RTX 2070 SUPER**. Measured on October 6, 2026, using **41 common aligned frame pairs**
-across five benchmark scenes.
+an **RTX 2070 SUPER**. Measured on October 6, 2026, using **37 common aligned frame pairs**
+across five benchmark scenes. The shop interval is excluded from every method because a
+background application briefly overlapped the CNN and DLSS recordings.
 
 | Method | PSNR (dB) ↑ | SSIM ↑ | Temporal error ↓ |
 |---|---:|---:|---:|
-| Deployed CNN (720p to 1440p) | 29.586 | 0.8154 | **0.02924** |
-| FSR 3.1.4 | 29.319 | 0.8024 | 0.03140 |
-| DLSS 3.8.10, preset E | **29.960** | **0.8254** | 0.02991 |
+| Deployed CNN (720p to 1440p) | 29.893 | 0.8183 | **0.03084** |
+| FSR 3.1.4 | 29.869 | 0.8088 | 0.03279 |
+| DLSS 3.8.10, preset E | **29.957** | **0.8207** | 0.03168 |
 
-In this sample, the CNN scored above FSR 3.1.4 on all three metrics. DLSS led PSNR and SSIM;
-the CNN had the lowest temporal error. The CNN row includes the deployed stabiliser
+In this sample, CNN and FSR 3.1.4 were nearly tied on PSNR; CNN had higher SSIM. DLSS led
+PSNR and SSIM, and CNN had the lowest temporal error. The CNN row includes the deployed stabiliser
 (`stabilize=0.85`). FSR 3.1.4 was verified through OptiScaler with the game's native FSR inputs,
 and the DLSS driver override was disabled to keep preset E active.
 
